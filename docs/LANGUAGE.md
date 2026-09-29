@@ -316,4 +316,5 @@ Swift, Kotlin, Java, Python and Metal code: exported functions, kernels, their
 parameters, structs and fields. These can't be a keyword of any of those
 languages (`class`, `default`, `val`, `self`, `device`, …), because the
 generated code would not compile. The compiler says which language reserves the
-name.
+name. Names starting with `ha_` are also reserved, because the generated code
+uses them.

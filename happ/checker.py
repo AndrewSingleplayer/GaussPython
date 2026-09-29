@@ -442,6 +442,9 @@ class Checker:
         if name in FOREIGN_RESERVED:
             raise HappError(f"{what} '{name}' is a keyword in C, Swift, Kotlin, Java, Python or Metal, "
                             f"which the generated bridges use", loc, "pick another name")
+        if name.lower().startswith("ha_"):
+            raise HappError(f"{what} '{name}': names starting with 'ha_' are used by the generated code",
+                            loc, "pick another name")
 
     def check_signature(self, fn):
         if fn.name in RESERVED:
