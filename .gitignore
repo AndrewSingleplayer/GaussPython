@@ -3,3 +3,4 @@ __pycache__/
 build/
 .work/
 /splats.png
+gaussian/data/

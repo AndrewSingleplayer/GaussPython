@@ -176,12 +176,13 @@ def camera_bytes(cam, width, height, tiles_x, tiles_y):
                         cam["near"], cam["far"], tiles_x, tiles_y))
 
 
-def look_at(eye, target, width, height, fov_deg=60.0, near=0.2, far=100.0):
-    """Camera looking from eye to target (camera space: x right, y down, z forward)."""
+def look_at(eye, target, width, height, fov_deg=60.0, near=0.2, far=100.0, up=(0.0, 1.0, 0.0)):
+    """Camera looking from eye to target (camera space: x right, y down, z forward). `up` is the
+    scene's up direction: +y for the demo scenes, often -y for captures in the COLMAP convention."""
     eye, target = np.asarray(eye, np.float64), np.asarray(target, np.float64)
     fwd = target - eye
     fwd /= np.linalg.norm(fwd)
-    right = np.cross(fwd, [0.0, 1.0, 0.0])
+    right = np.cross(fwd, np.asarray(up, np.float64))
     right /= np.linalg.norm(right)
     down = np.cross(fwd, right)
     r = np.stack([right, down, fwd])
