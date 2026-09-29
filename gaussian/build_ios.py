@@ -50,6 +50,7 @@ SYSTEM_SYMBOLS = {
     "/System/Library/Frameworks/UIKit.framework/UIKit": ["_UIApplicationMain"],
     "/System/Library/Frameworks/Metal.framework/Metal": ["_MTLCreateSystemDefaultDevice"],
     "/System/Library/Frameworks/QuartzCore.framework/QuartzCore": ["_CACurrentMediaTime"],
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation": ["_kCFRunLoopCommonModes"],
     "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics": [
         "_CGColorSpaceCreateDeviceRGB", "_CGColorSpaceRelease", "_CGDataProviderCreateWithData",
         "_CGDataProviderRelease", "_CGImageCreate", "_CGImageRelease"],
@@ -108,12 +109,13 @@ def info_plist(has_icon):
         "UIRequiredDeviceCapabilities": ["arm64", "metal"],
         "UILaunchScreen": {},
         "UIStatusBarHidden": True,
+        "UIViewControllerBasedStatusBarAppearance": False,     # else the status bar comes back after launch
         "UISupportedInterfaceOrientations": ["UIInterfaceOrientationPortrait",
                                              "UIInterfaceOrientationLandscapeLeft",
                                              "UIInterfaceOrientationLandscapeRight"],
     }
     if has_icon:
-        icons = {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ["AppIcon60x60"], "CFBundleIconName": "AppIcon"}}
+        icons = {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ["AppIcon60x60"]}}   # PNG files, no asset catalog
         info["CFBundleIcons"] = icons
         info["CFBundleIcons~ipad"] = {"CFBundlePrimaryIcon": {"CFBundleIconFiles": ["AppIcon60x60",
                                                                                        "AppIcon76x76"]}}
@@ -218,6 +220,7 @@ def main():
                 arc = os.path.join("Payload", os.path.relpath(path, out))
                 zi = zipfile.ZipInfo(arc)
                 zi.compress_type = zipfile.ZIP_DEFLATED
+                zi.create_system = 3          # Unix: otherwise (on Windows) unzippers ignore the executable bit
                 mode = 0o755 if name == APP_NAME else 0o644
                 zi.external_attr = (0o100000 | mode) << 16
                 with open(path, "rb") as fh:

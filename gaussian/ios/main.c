@@ -40,6 +40,9 @@ void objc_autoreleasePoolPop(void *pool);
 int UIApplicationMain(int argc, char **argv, id principal, id delegate_class_name);
 id MTLCreateSystemDefaultDevice(void);
 double CACurrentMediaTime(void);
+/* The run-loop mode must be this very object: CoreFoundation compares it by address, and any
+   other string called "kCFRunLoopCommonModes" becomes a separate mode that UIKit never runs. */
+extern id const kCFRunLoopCommonModes;
 
 typedef struct CGColorSpace *CGColorSpaceRef;
 typedef struct CGDataProvider *CGDataProviderRef;
@@ -101,6 +104,7 @@ static struct {
     size_t caps[B_COUNT];
     uint32_t n;
     int width, height;
+    CGFloat scale;
     double yaw, pitch, dist, last_touch;
     double frame_ms, fps_time;
     int frames;
@@ -114,14 +118,21 @@ static void set_status(const char *text) {
 }
 
 /* ------------------------------------------------------------------ Metal renderer */
-static id buffer(int which, size_t bytes) {
+/* A GPU buffer of at least `bytes`. Buffers whose size changes every frame grow by 1.5x so that
+   moving the camera doesn't reallocate them over and over. False (with a message) if out of memory. */
+static bool buffer(int which, size_t bytes, bool grows) {
     if (bytes < 16) bytes = 16;
-    if (app.bufs[which] && app.caps[which] >= bytes) return app.bufs[which];
+    if (app.bufs[which] && app.caps[which] >= bytes) return true;
     if (app.bufs[which]) call0(app.bufs[which], "release");
+    size_t size = grows ? bytes + bytes / 2 : bytes;
     app.bufs[which] = MSG(id, id, SEL, NSUInteger, NSUInteger)(app.device, SEL_("newBufferWithLength:options:"),
-                                                               (NSUInteger)bytes, 0 /* shared CPU/GPU memory */);
-    app.caps[which] = bytes;
-    return app.bufs[which];
+                                                               (NSUInteger)size, 0 /* shared CPU/GPU memory */);
+    app.caps[which] = app.bufs[which] ? size : 0;
+    if (!app.bufs[which]) {
+        snprintf(app.status, sizeof app.status, "Out of GPU memory (%lu MB buffer)", (unsigned long)(size >> 20));
+        return false;
+    }
+    return true;
 }
 
 static void *contents(int which) { return MSG(void *, id, SEL)(app.bufs[which], SEL_("contents")); }
@@ -190,15 +201,15 @@ static bool load_scene(void) {
         make_galaxy(raw, n, 1);          /* HA++ code */
     }
     app.n = n;
-    buffer(B_SPLATS, (size_t)n * sizeof(PackedSplat));
+    if (!buffer(B_SPLATS, (size_t)n * sizeof(PackedSplat), false)) {
+        free(raw);
+        return false;
+    }
     pack_splats(raw, (PackedSplat *)contents(B_SPLATS), n);      /* HA++ code: 32 bytes per splat */
     free(raw);
-    buffer(B_CAMERA, sizeof(Camera));
-    buffer(B_PROJS, (size_t)n * sizeof(Proj));
-    buffer(B_COUNTS, (size_t)n * 4);
-    buffer(B_OFFSETS, (size_t)n * 4);
-    buffer(B_SUMS, 4 * (((size_t)n + 255) / 256));
-    return true;
+    return buffer(B_CAMERA, sizeof(Camera), false) && buffer(B_PROJS, (size_t)n * sizeof(Proj), false) &&
+           buffer(B_COUNTS, (size_t)n * 4, false) && buffer(B_OFFSETS, (size_t)n * 4, false) &&
+           buffer(B_SUMS, 4 * (((size_t)n + 255) / 256), false);
 }
 
 static MTLSize groups1(size_t items, unsigned wg) {
@@ -242,9 +253,9 @@ static bool run(id cmd) {
     call0(cmd, "waitUntilCompleted");
     id err = msg0(cmd, "error");
     if (err) {
-        snprintf(app.status, sizeof app.status, "GPU error: %s", error_text(err));
+        /* e.g. work submitted while the app goes to the background: skip this frame, try the next one */
+        snprintf(app.status, sizeof app.status, "GPU error (will retry): %s", error_text(err));
         set_status(app.status);
-        app.ready = false;
         return false;
     }
     return true;
@@ -275,6 +286,9 @@ static void free_pixels(void *info, const void *data, size_t size) {
     (void)size;
     free((void *)data);
 }
+
+#define MAX_PAIRS (8u << 20)        /* about 170 MB of sort buffers */
+#define MIN_DIST 2.0
 
 static void render_frame(void) {
     const uint32_t n = app.n;
@@ -312,16 +326,25 @@ static void render_frame(void) {
     uint32_t total = n ? offsets[n - 1] + counts[n - 1] : 0;
     app.pairs = total;
 
+    if (total > MAX_PAIRS) {
+        /* every (splat, tile) pair costs about 20 bytes and sorting time: keep the last image */
+        snprintf(app.status, sizeof app.status, "Too close: %u tile pairs (limit %u).\nPinch out.", total,
+                 (unsigned)MAX_PAIRS);
+        set_status(app.status);
+        app.fps_time = CACurrentMediaTime();
+        app.frames = 0;
+        return;
+    }
+
     /* phase B: bin, radix sort, tile ranges, render */
     uint32_t ntiles = tiles_x * tiles_y, nb = total ? (total + 255) / 256 : 1;
-    buffer(B_KEYS0, (size_t)total * 4);
-    buffer(B_VALS0, (size_t)total * 4);
-    buffer(B_KEYS1, (size_t)total * 4);
-    buffer(B_VALS1, (size_t)total * 4);
-    buffer(B_HIST, (size_t)256 * nb * 4);
-    buffer(B_HSUMS, (size_t)nb * 4);
-    buffer(B_SPANS, (size_t)ntiles * 8);
-    buffer(B_IMAGE, (size_t)w * h * 4);
+    if (!(buffer(B_KEYS0, (size_t)total * 4, true) && buffer(B_VALS0, (size_t)total * 4, true) &&
+          buffer(B_KEYS1, (size_t)total * 4, true) && buffer(B_VALS1, (size_t)total * 4, true) &&
+          buffer(B_HIST, (size_t)256 * nb * 4, true) && buffer(B_HSUMS, (size_t)nb * 4, true) &&
+          buffer(B_SPANS, (size_t)ntiles * 8, true) && buffer(B_IMAGE, (size_t)w * h * 4, true))) {
+        set_status(app.status);
+        return;
+    }
     cmd = msg0(app.queue, "commandBuffer");
     enc = msg0(cmd, "computeCommandEncoder");
     if (total) {
@@ -387,11 +410,25 @@ static void render_frame(void) {
 }
 
 /* ------------------------------------------------------------------ UIKit callbacks */
+/* Render size follows the view: rotation, iPad Split View and Stage Manager change it. */
+static void fit_to_view(void) {
+    CGRect b = MSG(CGRect, id, SEL)(app.view, SEL_("bounds"));
+    int w = (int)(b.size.width * app.scale / 2), h = (int)(b.size.height * app.scale / 2);  /* half resolution */
+    if (w < 16) w = 16;
+    if (h < 16) h = 16;
+    if (w == app.width && h == app.height) return;
+    app.width = w;
+    app.height = h;
+    CGRect label_frame = {{16, 48}, {b.size.width - 32, 72}};
+    MSG(void, id, SEL, CGRect)(app.label, SEL_("setFrame:"), label_frame);
+}
+
 static void on_tick(id self, SEL cmd, id link) {
     (void)self;
     (void)cmd;
     (void)link;
     if (!app.ready) return;
+    fit_to_view();
     if (CACurrentMediaTime() - app.last_touch > 2.0) app.yaw += 0.004;     /* slow automatic orbit */
     render_frame();
 }
@@ -414,10 +451,27 @@ static void on_pinch(id self, SEL cmd, id gesture) {
     (void)cmd;
     CGFloat s = MSG(CGFloat, id, SEL)(gesture, SEL_("scale"));
     if (s > 0.01) app.dist /= s;
-    if (app.dist < 0.5) app.dist = 0.5;
+    if (app.dist < MIN_DIST) app.dist = MIN_DIST;
     if (app.dist > 30.0) app.dist = 30.0;
     MSG(void, id, SEL, CGFloat)(gesture, SEL_("setScale:"), 1.0);
     app.last_touch = CACurrentMediaTime();
+}
+
+/* Metal refuses work from the background: stop the frame loop while the app isn't active. */
+static void will_resign_active(id self, SEL cmd, id application) {
+    (void)self;
+    (void)cmd;
+    (void)application;
+    if (app.link) MSG(void, id, SEL, bool)(app.link, SEL_("setPaused:"), true);
+}
+
+static void did_become_active(id self, SEL cmd, id application) {
+    (void)self;
+    (void)cmd;
+    (void)application;
+    if (app.link) MSG(void, id, SEL, bool)(app.link, SEL_("setPaused:"), false);
+    app.fps_time = CACurrentMediaTime();
+    app.frames = 0;
 }
 
 static id delegate_window(id self, SEL cmd) {
@@ -457,8 +511,10 @@ static bool did_finish_launching(id self, SEL cmd, id application, id options) {
     msg1(app.view, "addGestureRecognizer:", pinch);
 
     /* render at half the screen's pixel resolution: plenty for splats, 4x less work */
+    app.scale = scale;
     app.width = (int)(bounds.size.width * scale / 2);
     app.height = (int)(bounds.size.height * scale / 2);
+    app.fps_time = CACurrentMediaTime();
     app.dist = 5.5;
     app.pitch = 0.6;
     app.yaw = 0.0;
@@ -473,7 +529,7 @@ static bool did_finish_launching(id self, SEL cmd, id application, id options) {
                                          SEL_("tick:"));
     MSG(void, id, SEL, NSInteger)(app.link, SEL_("setPreferredFramesPerSecond:"), 60);
     MSG(void, id, SEL, id, id)(app.link, SEL_("addToRunLoop:forMode:"), msg0(cls("NSRunLoop"), "mainRunLoop"),
-                               nsstr("kCFRunLoopCommonModes"));
+                               kCFRunLoopCommonModes);
     return true;
 }
 
@@ -485,6 +541,8 @@ int main(int argc, char **argv) {
     class_addMethod(delegate, SEL_("tick:"), (IMP)on_tick, "v@:@");
     class_addMethod(delegate, SEL_("pan:"), (IMP)on_pan, "v@:@");
     class_addMethod(delegate, SEL_("pinch:"), (IMP)on_pinch, "v@:@");
+    class_addMethod(delegate, SEL_("applicationWillResignActive:"), (IMP)will_resign_active, "v@:@");
+    class_addMethod(delegate, SEL_("applicationDidBecomeActive:"), (IMP)did_become_active, "v@:@");
     objc_registerClassPair(delegate);
     id name = nsstr("HASplatAppDelegate");
     int rc = UIApplicationMain(argc, argv, (id)0, name);

@@ -501,8 +501,9 @@ class IPhoneApp(TempDirCase):
         with zipfile.ZipFile(os.path.join(out, "Splats.ipa")) as z:
             names = z.namelist()
             self.assertIn("Payload/Splats.app/Splats", names)
-            mode = z.getinfo("Payload/Splats.app/Splats").external_attr >> 16
-            self.assertTrue(mode & 0o111, "the app binary must be executable")
+            zi = z.getinfo("Payload/Splats.app/Splats")
+            self.assertTrue((zi.external_attr >> 16) & 0o111, "the app binary must be executable")
+            self.assertEqual(zi.create_system, 3, "Unix attributes, or unzippers drop the executable bit")
             info = plistlib.loads(z.read("Payload/Splats.app/Info.plist"))
             exe = z.read("Payload/Splats.app/Splats")
         self.assertEqual(info["CFBundleExecutable"], "Splats")
@@ -522,6 +523,8 @@ class IPhoneApp(TempDirCase):
             undef = subprocess.run([nm, "-u", app], capture_output=True, text=True, check=True).stdout.split()
             self.assertTrue(undef)
             self.assertEqual(sorted(set(undef) - exported), [])
+            # the display link must be added in the real common-modes object (compared by address)
+            self.assertIn("_kCFRunLoopCommonModes", undef)
 
 
 @unittest.skipUnless(have("clang++"), "needs clang++")

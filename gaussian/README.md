@@ -77,11 +77,16 @@ current instructions.
 
 ## Using the app
 
-- **One finger:** orbit around the scene.
-- **Pinch:** zoom.
+- **One finger:** orbit around the scene. After 2 seconds without touching,
+  the camera orbits slowly by itself.
+- **Pinch:** zoom. Very close views create millions of (splat, tile) pairs to
+  sort. Above 8 million the app keeps the last image and asks you to pinch out,
+  instead of running out of memory.
 - The text at the top shows the number of splats, the frame time and the fps.
   If something goes wrong, for example a Metal compile error, the message
   appears there too.
+- Rotation, iPad Split View and Stage Manager are handled: the image is
+  re-rendered at the new size. The app pauses rendering in the background.
 
 ## What is tested, and what isn't
 
