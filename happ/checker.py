@@ -117,6 +117,7 @@ class Checker:
                 self.declare_global(it.name, it.loc)
                 st = T.Struct(it.name)
                 st.loc = it.loc
+                st.is_std = m.is_std
                 it.ty = st
                 self.structs[it.name] = (st, it)
         for m, it in items:
@@ -528,8 +529,13 @@ class Checker:
     def bind(self, name, sym, loc):
         if name in self.scopes[-1]:
             raise HappError(f"'{name}' is already defined in this block", loc)
-        if name in T.NAMED_TYPES or name in self.structs:
+        if name in T.NAMED_TYPES:
             raise HappError(f"'{name}' is a type name", loc)
+        if name in self.structs:
+            # std-library code never names the user's structs, so its locals may reuse those names
+            in_std = self.fn is not None and getattr(self.fn, "is_std", False)
+            if not (in_std and not self.structs[name][0].is_std):
+                raise HappError(f"'{name}' is a type name", loc)
         self.scopes[-1][name] = sym
 
     def lookup(self, name):

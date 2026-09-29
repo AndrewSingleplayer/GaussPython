@@ -122,6 +122,10 @@ class FrontEnd(unittest.TestCase):
         prog = check_src("const PI: f32 = 3.0; fn sigmoid(x: f32) -> f32 { return x; }")
         self.assertEqual(prog.consts["PI"].value, 3.0)
         self.assertFalse(prog.fns["sigmoid"].is_std)
+        # the std library has locals such as 'a' and 'r'; user structs with those names don't break it
+        check_src("struct a { x: f32 } struct r { y: f32 } fn f(p: a) -> f32 { return atan2(p.x, 1.0) + exp(p.x); }")
+        with self.assertRaises(HappError):     # but in user code a local can't take a type's name
+            check_src("struct a { x: f32 } fn f() -> f32 { let a = 1.0; return a; }")
 
 
 # ====================================================================== CPU
