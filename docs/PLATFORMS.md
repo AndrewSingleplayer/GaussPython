@@ -72,8 +72,9 @@ folder. The Android NDK's `toolchains/llvm/prebuilt/*/bin` also works: set
 | pointer to a number type | primitive array (`FloatArray`, `IntArray`, …) |
 | pointer to a struct/vector | direct `ByteBuffer` (`ByteBuffer.allocateDirect(n).order(ByteOrder.nativeOrder())`) |
 
-Struct sizes and field offsets are constants in the class, e.g. `SPLAT_BYTES`
-and `SPLAT_POS`.
+Struct sizes and field offsets are constants in the class, e.g.
+`SIZEOF_SPLAT` and `OFFSET_SPLAT_POS`. Kernel workgroup sizes are
+`WORKGROUP_<KERNEL>_X/Y/Z`.
 
 **Build settings:**
 - **minSdk:** 24 for CPU code. Use **29** for GPU kernels, because every
@@ -128,7 +129,26 @@ because Apple's clang has no `ld.lld`.
    let gpu = try MyGPU()                         // Metal: kernels compiled on the device
    ```
 
-## iPhone, without a Mac (from Windows or Linux)
+## iPhone, without a Mac and without any Apple files (C apps)
+
+An app written in C (plus HA++) can be built into an `.ipa` on Windows or Linux
+with only LLVM. You don't need Xcode, the iOS SDK or an `Xcode.xip`. The app
+talks to UIKit and Metal through the Objective-C runtime. The linker learns
+which iOS library exports each function from small text files (`.tbd`) that the
+build script writes itself.
+
+`gaussian/build_ios.py` does this for the Gaussian splat viewer:
+
+```
+python3 gaussian/build_ios.py          # -> gaussian/build/ios/Splats.ipa
+```
+
+Install the `.ipa` with **Sideloadly** (Windows/Mac) or **AltStore**. These
+tools sign it with your Apple ID. [gaussian/README.md](../gaussian/README.md)
+has the steps. Use this route for small, self-contained apps. For Swift or
+ARKit apps, use the xtool route below.
+
+## iPhone, without a Mac (Swift apps, from Windows or Linux)
 
 HA++ does everything up to the finished Swift package without Apple tools:
 - It compiles for ARM64 iOS.

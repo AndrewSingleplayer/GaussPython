@@ -254,6 +254,46 @@ class VulkanHeader(unittest.TestCase):
         self.assertEqual(diffs, [])
 
 
+EDGE_N = 100            # tests/gpu_edge.ha: two workgroups, the second one partly idle
+EDGE_M_BYTES = 76       # struct M { m: mat3, v: vec3, w: [3][2]f32, h: hvec2 }
+
+
+def edge_inputs():
+    rng = np.random.default_rng(5)
+    n = EDGE_N
+    ms = np.zeros((n, EDGE_M_BYTES // 4), np.float32)
+    ms[:, :18] = rng.uniform(-10, 10, (n, 18)).astype(np.float32)
+    ms.view(np.uint32)[:, 18] = rng.uniform(-8, 8, (n, 2)).astype(np.float16).view(np.uint32).ravel()
+    iv = rng.integers(-2 ** 31, 2 ** 31, (n, 3), dtype=np.int64).astype(np.int32)
+    iv[:4] = -2 ** 31                            # INT_MIN / -1 and INT_MIN % -1
+    uv = rng.integers(0, 2 ** 32, (n, 3), dtype=np.uint64).astype(np.uint32)
+    return [ms, np.zeros(3, np.uint32), rng.normal(size=2 * n).astype(np.float32), iv, uv,
+            np.zeros(n, np.float32)]
+
+
+def edge_cpu(lib):
+    arrays = [a.copy() for a in edge_inputs()]
+    lib.edge_cpu.argtypes = [P] * 6 + [ctypes.c_float, U32, U32, U32, U32]
+    lib.edge_cpu(*[a.ctypes.data for a in arrays], 1.5, EDGE_N, 2, 1, 1)
+    return arrays
+
+
+def edge_compare(case, got, want):
+    ms, cnt, hits, iv, uv, out = got
+    ms_w, cnt_w, hits_w, iv_w, uv_w, out_w = want
+    np.testing.assert_array_equal(cnt, [EDGE_N] * 3)          # every atomic ran exactly once
+    np.testing.assert_array_equal(cnt_w, [EDGE_N] * 3)
+    np.testing.assert_array_equal(iv, iv_w)
+    np.testing.assert_array_equal(uv, uv_w)
+    np.testing.assert_array_equal(hits, hits_w)
+    np.testing.assert_allclose(ms[:, :18], ms_w[:, :18], rtol=1e-5, atol=1e-5)
+    half = lambda a: np.ascontiguousarray(a[:, 18]).view(np.float16)
+    np.testing.assert_allclose(half(ms), half(ms_w), rtol=2e-3)
+    np.testing.assert_allclose(out, out_w, rtol=1e-5, atol=1e-4)
+    i = np.arange(EDGE_N)                                     # m[1].y = 5 landed in memory (then x3 where
+    np.testing.assert_array_equal(ms_w[:, 4], np.where((i % 3 == 1) & (i % 2 == 1), 15.0, 5.0))  # m[i%3][i%2])
+
+
 @unittest.skipUnless(VULKAN, "needs glslangValidator and a Vulkan driver (e.g. lavapipe)")
 class GPU(TempDirCase):
     def gpu_lib(self, src, name):
@@ -303,6 +343,61 @@ class GPU(TempDirCase):
         _, counts = self.run_kernel(lib, gpu, "kernels", "hist", [keys, np.zeros(256, np.uint32)],
                                     struct.pack("<I", len(keys)), ((len(keys) + 255) // 256, 1, 1))
         np.testing.assert_array_equal(counts, np.bincount(keys >> 24, minlength=256))
+
+    def test_edge_cases_match_cpu(self):
+        src = os.path.join(TESTS, "gpu_edge.ha")
+        lib, gpu = self.gpu_lib(src, "edge")
+        got = self.run_kernel(lib, gpu, "gpu_edge", "edge", edge_inputs(), struct.pack("<fI", 1.5, EDGE_N),
+                              (2, 1, 1))
+        edge_compare(self, got, edge_cpu(lib))
+
+    def test_runtime_batches_and_errors(self):
+        """Many dispatches in one batch (descriptor pools chained), bad calls, and recovery after them."""
+        src = self.write("rt.ha", "kernel bump(a: *u32, b: *u32, n: u32) {\n"
+                                  "    let i = global_id.x;\n    if i < n { a[i] += 1; b[i] += a[i]; }\n}\n")
+        out = build(src, ["linux-x64"], os.path.join(self.tmp, "rt"), quiet=True)
+        with open(os.path.join(os.path.dirname(out["linux-x64"]), "..", "gpu", "rt_bump.spv"), "rb") as f:
+            spv = f.read()
+        so = os.path.join(self.tmp, "libhagpu_small_pools.so")
+        subprocess.run([TC.find("clang"), "-shared", "-fPIC", "-O2", "-DHA_MAX_SETS=3",
+                        os.path.join(ROOT, "runtime", "gpu", "ha_gpu.c"), "-o", so], check=True)
+        lib = ctypes.CDLL(so)
+        sig = [("ha_gpu_create", P, [ctypes.c_char_p, ctypes.c_size_t]), ("ha_buffer_create", P, [P, ctypes.c_size_t]),
+               ("ha_buffer_data", P, [P]), ("ha_kernel_create", P, [P, ctypes.c_char_p, ctypes.c_size_t, U32, U32]),
+               ("ha_batch_begin", ctypes.c_int, [P]), ("ha_batch_submit", ctypes.c_int, [P]),
+               ("ha_batch_dispatch", ctypes.c_int, [P, P, P, P, U32, U32, U32]),
+               ("ha_kernel_destroy", None, [P]), ("ha_gpu_destroy", None, [P])]
+        for f, r, a in sig:
+            fn = getattr(lib, f)
+            fn.restype, fn.argtypes = r, a
+        gpu = lib.ha_gpu_create(None, 0)
+        self.assertTrue(gpu)
+        n = 100
+        k = lib.ha_kernel_create(gpu, spv, len(spv), 2, 4)
+        a, b = lib.ha_buffer_create(gpu, 4 * n), lib.ha_buffer_create(gpu, 4 * n)
+        ctypes.memset(lib.ha_buffer_data(a), 0, 4 * n)
+        ctypes.memset(lib.ha_buffer_data(b), 0, 4 * n)
+        bufs = (P * 2)(a, b)
+        push = struct.pack("<I", n)
+
+        def batch(count, bad_at=()):
+            self.assertEqual(lib.ha_batch_begin(gpu), 0)
+            for j in range(count):
+                if j in bad_at:     # a missing buffer: rejected before anything is recorded
+                    self.assertEqual(lib.ha_batch_dispatch(gpu, k, (P * 2)(a, None), push, 2, 1, 1), -4)
+                self.assertEqual(lib.ha_batch_dispatch(gpu, k, bufs, push, 2, 1, 1), 0)
+            return lib.ha_batch_submit(gpu)
+
+        self.assertEqual(batch(40, bad_at={5, 17}), 0)      # 40 dispatches with 3 sets per pool: 14 pools
+        self.assertEqual(batch(7), 0)                       # pools were reset and are reused
+        va = np.frombuffer(ctypes.string_at(lib.ha_buffer_data(a), 4 * n), np.uint32)
+        vb = np.frombuffer(ctypes.string_at(lib.ha_buffer_data(b), 4 * n), np.uint32)
+        self.assertTrue((va == 47).all())                   # every dispatch ran exactly once, in order
+        self.assertTrue((vb == 47 * 48 // 2).all())
+        self.assertEqual(lib.ha_batch_submit(gpu), -1)      # no batch open
+        self.assertEqual(lib.ha_batch_dispatch(gpu, k, bufs, push, 1, 1, 1), -1)
+        lib.ha_kernel_destroy(k)
+        lib.ha_gpu_destroy(gpu)
 
     def test_splat_pipeline_matches_reference(self):
         import render as R
@@ -379,6 +474,52 @@ class GPU(TempDirCase):
         np.testing.assert_array_equal(java_img, img.view(np.uint8).ravel())
 
 
+class Fuzz(TempDirCase):
+    def test_short_differential_fuzz(self):
+        """Random expressions on every available back end vs the Python model (tests/fuzz.py runs longer)."""
+        import fuzz
+        runner = fuzz.Runner(self.tmp)
+        for seed in (11, 12):
+            with self.subTest(seed=seed):
+                bad, src, _ = fuzz.run_one(seed, runner, n_expr=12, depth=4)
+                self.assertEqual(bad[:5], [], f"fuzz seed {seed} disagrees with the model")
+
+
+@unittest.skipUnless(have("clang", "ld64.lld"), "needs clang and ld64.lld")
+class IPhoneApp(TempDirCase):
+    def test_ipa_builds_without_apple_files(self):
+        """gaussian/build_ios.py: a complete iPhone app from LLVM alone (running it needs a real iPhone)."""
+        import zipfile
+        out = os.path.join(self.tmp, "ios")
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "gaussian", "build_ios.py"), "--no-icon",
+                            "--out", out], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with zipfile.ZipFile(os.path.join(out, "Splats.ipa")) as z:
+            names = z.namelist()
+            self.assertIn("Payload/Splats.app/Splats", names)
+            mode = z.getinfo("Payload/Splats.app/Splats").external_attr >> 16
+            self.assertTrue(mode & 0o111, "the app binary must be executable")
+            info = plistlib.loads(z.read("Payload/Splats.app/Info.plist"))
+            exe = z.read("Payload/Splats.app/Splats")
+        self.assertEqual(info["CFBundleExecutable"], "Splats")
+        self.assertEqual(info["MinimumOSVersion"], "15.0")
+        self.assertEqual(struct.unpack("<II", exe[:8]), (0xFEEDFACF, 0x0100000C))   # 64-bit Mach-O, arm64
+        otool = TC.find("llvm-otool")
+        nm = TC.find("llvm-nm")
+        if otool and nm:
+            app = os.path.join(out, "Splats.app", "Splats")
+            lc = subprocess.run([otool, "-l", app], capture_output=True, text=True, check=True).stdout
+            for cmd in ("LC_MAIN", "LC_BUILD_VERSION", "LC_CODE_SIGNATURE", "LC_DYLD_CHAINED_FIXUPS"):
+                self.assertIn(cmd, lc)
+            self.assertRegex(lc, r"platform 2\b")                    # iOS
+            # every symbol the app imports is one the .tbd files promise an iOS library exports
+            import build_ios
+            exported = {x for syms in build_ios.SYSTEM_SYMBOLS.values() for x in syms}
+            undef = subprocess.run([nm, "-u", app], capture_output=True, text=True, check=True).stdout.split()
+            self.assertTrue(undef)
+            self.assertEqual(sorted(set(undef) - exported), [])
+
+
 @unittest.skipUnless(have("clang++"), "needs clang++")
 class MetalEmulation(TempDirCase):
     def test_metal_kernels_compile_and_match_cpu(self):
@@ -399,9 +540,9 @@ int main() {{
     std::vector<float> s(n * 14), out(n * 7, 0.0f);
     FILE *f = fopen("in.bin", "rb"); fread(s.data(), 4, n * 14, f); fclose(f);
     ha_params_project p{{n, 500.0f}};
-    static_assert(sizeof(h_Splat) == 56 && sizeof(h_Out2D) == 28, "layout");
+    static_assert(sizeof(hs_Splat) == 56 && sizeof(hs_Out2D) == 28, "layout");
     for (unsigned x = 0; x < ((n + 63) / 64) * 64; x++)
-        project((h_Splat *)s.data(), (h_Out2D *)out.data(), p, metal::uint3{{x, 0, 0}}, metal::uint3{{x % 64, 0, 0}},
+        project((hs_Splat *)s.data(), (hs_Out2D *)out.data(), p, metal::uint3{{x, 0, 0}}, metal::uint3{{x % 64, 0, 0}},
                 metal::uint3{{x / 64, 0, 0}}, metal::uint3{{(n + 63) / 64, 1, 1}}, metal::uint3{{64, 1, 1}});
     f = fopen("out.bin", "wb"); fwrite(out.data(), 4, n * 7, f); fclose(f);
 }}
@@ -426,6 +567,49 @@ int main() {{
                 subprocess.run(["clang++", "-std=c++17", "-fsyntax-only", "-x", "c++", "-I",
                                 os.path.join(TESTS, "metal_shim"), "-Wno-unknown-attributes",
                                 "-Wno-ignored-attributes", src], check=True)
+
+    def test_metal_edge_cases_match_cpu(self):
+        from happ.gpu import generate_metal
+        src = os.path.join(TESTS, "gpu_edge.ha")
+        with open(os.path.join(self.tmp, "k.metal"), "w") as f:
+            f.write(generate_metal(load_program(src)))
+        arrays = edge_inputs()
+        for i, a in enumerate(arrays):
+            a.tofile(os.path.join(self.tmp, f"in{i}.bin"))
+        sizes = [a.nbytes for a in arrays]
+        drv = self.write("drv.cpp", f"""#include "k.metal"
+#include <cstdio>
+#include <vector>
+int main() {{
+    const unsigned sizes[6] = {{{", ".join(map(str, sizes))}}};
+    std::vector<std::vector<unsigned char>> b(6);
+    for (int i = 0; i < 6; i++) {{
+        char name[16]; snprintf(name, sizeof name, "in%d.bin", i);
+        b[i].resize(sizes[i]);
+        FILE *f = fopen(name, "rb"); fread(b[i].data(), 1, sizes[i], f); fclose(f);
+    }}
+    static_assert(sizeof(hs_M) == {EDGE_M_BYTES}, "layout");
+    ha_params_edge p{{1.5f, {EDGE_N}u}};
+    for (unsigned x = 0; x < 128; x++)
+        edge((hs_M *)b[0].data(), (uint *)b[1].data(), (float *)b[2].data(), (packed_int3 *)b[3].data(),
+             (packed_uint3 *)b[4].data(), (float *)b[5].data(), p, metal::uint3{{x, 0, 0}},
+             metal::uint3{{x % 64, 0, 0}}, metal::uint3{{x / 64, 0, 0}}, metal::uint3{{2, 1, 1}},
+             metal::uint3{{64, 1, 1}});
+    for (int i = 0; i < 6; i++) {{
+        char name[16]; snprintf(name, sizeof name, "out%d.bin", i);
+        FILE *f = fopen(name, "wb"); fwrite(b[i].data(), 1, sizes[i], f); fclose(f);
+    }}
+}}
+""")
+        exe = os.path.join(self.tmp, "drv")
+        subprocess.run(["clang++", "-std=c++17", "-O1", "-I", os.path.join(TESTS, "metal_shim"),
+                        "-Wno-unknown-attributes", "-Wno-ignored-attributes", drv, "-o", exe], check=True)
+        subprocess.run([exe], check=True, cwd=self.tmp)
+        got = [np.fromfile(os.path.join(self.tmp, f"out{i}.bin"), a.dtype).reshape(a.shape)
+               for i, a in enumerate(arrays)]
+        lib = ctypes.CDLL(build(src, ["linux-x64"], os.path.join(self.tmp, "b"), quiet=True, bridges=False,
+                                gpu_runtime=False)["linux-x64"])
+        edge_compare(self, got, edge_cpu(lib))
 
 
 if __name__ == "__main__":

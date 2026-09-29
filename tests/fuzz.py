@@ -86,7 +86,9 @@ class Gen:
         if op in ("+", "-", "*", "&", "|", "^", "min", "max"):
             return Expr(op, t, [self.gen(t, d), self.gen(t, d)])
         if op in ("/", "%", "mod"):
-            return Expr(op, t, [self.gen(t, d), self.gen(t, d)])
+            # integers: sometimes divide by 0 or -1 on purpose (defined in HA++, guarded on GPUs)
+            raw = t != F32 and r.random() < 0.3
+            return Expr(op, t, [self.gen(t, d), self.gen(t, d)], val="raw" if raw else None)
         if op in ("<<", ">>"):
             return Expr(op, t, [self.gen(t, d), self.gen(t, d)])
         if op in ("neg", "not", "abs", "floor", "ceil", "trunc", "round", "fract", "sqrt", "popcount", "clz",
@@ -146,6 +148,8 @@ def text(e):
     if e.op in ("/", "%"):
         if t == F32:
             return f"({a[0]} {e.op} (abs({a[1]}) + 1.0))"
+        if e.val == "raw":
+            return f"({a[0]} {e.op} (({a[1]} & 15) - 1))"
         return f"({a[0]} {e.op} (({a[1]} & 15) + 1))"
     if e.op == "mod":
         return f"mod({a[0]}, abs({a[1]}) + 1.0)"
@@ -353,6 +357,14 @@ class Eval:
             return wrap(x - y, t)
         if op == "*":
             return wrap(x * y, t)
+        if op in ("/", "%") and e.val == "raw":
+            d = wrap((y & 15) - 1, t)             # x/0 = 0, x%0 = x, MIN/-1 = MIN, x%-1 = 0
+            if d == 0:
+                return 0 if op == "/" else x
+            if d == -1:
+                return wrap(-x, t) if op == "/" else 0
+            q = abs(x) // abs(d) * (1 if (x >= 0) == (d > 0) else -1)
+            return wrap(q if op == "/" else x - d * q, t)
         if op in ("/", "%"):
             d = (y & 15) + 1 if t == U32 else (wrap(y & 15, t) + 1)
             q = abs(x) // d * (1 if x >= 0 else -1)

@@ -20,12 +20,33 @@ stores vectors packed in buffers on every platform:
 So the bytes your app writes, from C, Swift, Kotlin `ByteBuffer` or NumPy, are
 the bytes the kernel reads. The C header asserts every struct size.
 
+## Same results as the CPU
+
+Every kernel also exists as a CPU function (`<kernel>_cpu`). The GPU code
+follows the same rules:
+- **Integer division** is defined: `x / 0 = 0`, `x % 0 = x`, `MIN / -1 = MIN`.
+  The generated code guards it, because GPUs leave these cases undefined. A
+  constant divisor needs no guard.
+- **Side effects run once.** `out[atomic_add(count, 0, 1)] += v` computes the
+  index once, and `select(c, a, b)` evaluates both values, as on the CPU.
+- **f16 math functions** (`sqrt`, `dot`, `round`, `min`, …) run in f32 on
+  Vulkan and are rounded to f16. Many phone drivers lack the extra Vulkan
+  features that native f16 versions need. Plain f16 arithmetic (`+ - * /`)
+  stays in f16.
+
+Floating-point results can still differ in the last bits, as between any two
+GPUs (fast-math, fused multiply-add). The tests check them with a tolerance.
+`tests/fuzz.py` compares every back end with an exact model and skips only
+results that depend on such rounding.
+
 ## Launching kernels (Vulkan runtime)
 
 `runtime/gpu/ha_gpu.c` is linked into Android/Windows/Linux libraries. It:
 - loads Vulkan when the app starts, so it isn't linked against it;
 - picks the best GPU;
-- enables f16 when the device supports it.
+- enables f16 when the device supports it;
+- lets a batch hold any number of dispatches (descriptor pools are added as needed) and
+  rejects bad calls (missing buffers, no open batch) before recording anything.
 
 C API (`include/ha_gpu.h`):
 

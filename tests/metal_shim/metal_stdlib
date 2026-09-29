@@ -24,6 +24,10 @@ HA_VT(float2, float, 2) HA_VT(float3, float, 3) HA_VT(float4, float, 4)
 HA_VT(int2, int, 2) HA_VT(int3, int, 3) HA_VT(int4, int, 4)
 HA_VT(uint2, uint, 2) HA_VT(uint3, uint, 3) HA_VT(uint4, uint, 4)
 HA_VT(half2, half, 2) HA_VT(half3, half, 3) HA_VT(half4, half, 4)
+// bool vectors: a vector compare gives an int vector (0 / -1) in clang; select() tests lanes != 0
+typedef int2 bool2;
+typedef int3 bool3;
+typedef int4 bool4;
 
 template <class V> struct vt;
 #define HA_TR(V, E, n) template <> struct vt<V> { typedef E elem; enum { N = n }; };
@@ -268,6 +272,9 @@ template <class T> inline T simd_prefix_exclusive_sum(T x) { return (T)0; }
 #define half2(...) ::metal::ha_make<::metal::half2>(__VA_ARGS__)
 #define half3(...) ::metal::ha_make<::metal::half3>(__VA_ARGS__)
 #define half4(...) ::metal::ha_make<::metal::half4>(__VA_ARGS__)
+#define bool2(...) ::metal::ha_make<::metal::bool2>(__VA_ARGS__)
+#define bool3(...) ::metal::ha_make<::metal::bool3>(__VA_ARGS__)
+#define bool4(...) ::metal::ha_make<::metal::bool4>(__VA_ARGS__)
 #define float2x2(...) ::metal::ha_make_mat<2>(__VA_ARGS__)
 #define float3x3(...) ::metal::ha_make_mat<3>(__VA_ARGS__)
 #define float4x4(...) ::metal::ha_make_mat<4>(__VA_ARGS__)

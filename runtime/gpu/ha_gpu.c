@@ -55,7 +55,11 @@ static const char *const VK_LIBS[] = {"libvulkan.so.1", "libvulkan.so", 0};
 #endif
 #endif
 
-#define MAX_SETS 256
+#ifndef HA_MAX_SETS
+#define HA_MAX_SETS 256       /* descriptor sets per pool; more pools are chained on demand */
+#endif
+#define MAX_SETS HA_MAX_SETS
+#define MAX_POOLS 64
 #define MAX_BATCH_KERNELS 64
 
 typedef struct {
@@ -154,7 +158,10 @@ struct ha_kernel {
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout layout;
     VkPipeline pipeline;
-    VkDescriptorPool pool;
+    VkDescriptorPool pools[MAX_POOLS];
+    uint32_t npools;             /* pools created so far */
+    uint32_t cur;                /* pool currently allocated from (reset after each submit) */
+    uint32_t nsets;              /* sets taken from pools[cur] */
     uint32_t num_buffers;
     uint32_t push_bytes;
 };
@@ -439,6 +446,35 @@ HA_GPU_API void ha_buffer_destroy(ha_buffer *b) {
     free(b);
 }
 
+static int add_pool(ha_kernel *k) {
+    if (k->npools >= MAX_POOLS) return 0;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_SETS * k->num_buffers};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, 0, 0, MAX_SETS, 1, &ps};
+    if (k->gpu->vk.CreateDescriptorPool(k->gpu->device, &dpci, 0, &k->pools[k->npools]) != VK_SUCCESS) return 0;
+    k->npools++;
+    return 1;
+}
+
+/* One descriptor set for a dispatch. When a pool is full the next one is used (created if needed),
+   so a batch can hold any number of dispatches of the same kernel (up to MAX_POOLS * MAX_SETS). */
+static VkDescriptorSet alloc_set(ha_kernel *k) {
+    for (;;) {
+        if (k->nsets >= MAX_SETS) {          /* full (counted here: not every driver reports it) */
+            k->cur++;
+            k->nsets = 0;
+        }
+        if (k->cur >= k->npools && !add_pool(k)) return 0;
+        VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, 0, k->pools[k->cur], 1,
+                                            &k->set_layout};
+        VkDescriptorSet set = 0;
+        if (k->gpu->vk.AllocateDescriptorSets(k->gpu->device, &dsai, &set) == VK_SUCCESS) {
+            k->nsets++;
+            return set;
+        }
+        k->nsets = MAX_SETS;                 /* out of pool memory anyway: next pool */
+    }
+}
+
 HA_GPU_API ha_kernel *ha_kernel_create(ha_gpu *gpu, const void *spirv, size_t spirv_bytes, uint32_t num_buffers,
                                        uint32_t push_bytes) {
     if (!gpu || !spirv || spirv_bytes < 20 || (spirv_bytes & 3)) return 0;
@@ -483,13 +519,9 @@ HA_GPU_API ha_kernel *ha_kernel_create(ha_gpu *gpu, const void *spirv, size_t sp
         ha_kernel_destroy(k);
         return 0;
     }
-    if (num_buffers) {
-        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_SETS * num_buffers};
-        VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, 0, 0, MAX_SETS, 1, &ps};
-        if (gpu->vk.CreateDescriptorPool(gpu->device, &dpci, 0, &k->pool) != VK_SUCCESS) {
-            ha_kernel_destroy(k);
-            return 0;
-        }
+    if (num_buffers && !add_pool(k)) {
+        ha_kernel_destroy(k);
+        return 0;
     }
     return k;
 }
@@ -498,7 +530,10 @@ HA_GPU_API void ha_kernel_destroy(ha_kernel *k) {
     if (!k) return;
     ha_gpu *gpu = k->gpu;
     VkDevice d = gpu->device;
-    if (k->pool) gpu->vk.DestroyDescriptorPool(d, k->pool, 0);
+    for (int i = 0; i < gpu->nused; i++) {        /* destroyed inside an open batch: forget it */
+        if (gpu->used[i] == k) gpu->used[i--] = gpu->used[--gpu->nused];
+    }
+    for (uint32_t i = 0; i < k->npools; i++) gpu->vk.DestroyDescriptorPool(d, k->pools[i], 0);
     if (k->pipeline) gpu->vk.DestroyPipeline(d, k->pipeline, 0);
     if (k->layout) gpu->vk.DestroyPipelineLayout(d, k->layout, 0);
     if (k->set_layout) gpu->vk.DestroyDescriptorSetLayout(d, k->set_layout, 0);
@@ -524,16 +559,24 @@ HA_GPU_API int ha_batch_begin(ha_gpu *gpu) {
 
 HA_GPU_API int ha_batch_dispatch(ha_gpu *gpu, ha_kernel *k, ha_buffer *const *buffers, const void *push,
                                  uint32_t gx, uint32_t gy, uint32_t gz) {
-    if (!gpu || !k || !gpu->in_batch) return -1;
+    if (!gpu || !k || !gpu->in_batch || k->gpu != gpu) return -1;
+    for (uint32_t i = 0; i < k->num_buffers; i++)       /* check everything before recording anything */
+        if (!buffers || !buffers[i] || buffers[i]->gpu != gpu) return -4;
+    /* the kernel's pools are reset after the submit, so it must be on the list before allocating */
+    int seen = 0;
+    for (int i = 0; i < gpu->nused; i++)
+        if (gpu->used[i] == k) seen = 1;
+    if (!seen) {
+        if (gpu->nused >= MAX_BATCH_KERNELS) return -5;
+        gpu->used[gpu->nused++] = k;
+    }
     VkDescriptorSet set = 0;
     if (k->num_buffers) {
-        VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, 0, k->pool, 1,
-                                            &k->set_layout};
-        if (gpu->vk.AllocateDescriptorSets(gpu->device, &dsai, &set) != VK_SUCCESS) return -3;
+        set = alloc_set(k);
+        if (!set) return -3;
         VkDescriptorBufferInfo infos[32];
         VkWriteDescriptorSet writes[32];
         for (uint32_t i = 0; i < k->num_buffers; i++) {
-            if (!buffers || !buffers[i]) return -4;
             VkDescriptorBufferInfo bi = {buffers[i]->buffer, 0, HA_VK_WHOLE_SIZE};
             infos[i] = bi;
             VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 0, set, i, 0, 1,
@@ -551,13 +594,6 @@ HA_GPU_API int ha_batch_dispatch(ha_gpu *gpu, ha_kernel *k, ha_buffer *const *bu
         gpu->vk.CmdPushConstants(gpu->cmd, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, k->push_bytes, push);
     gpu->vk.CmdDispatch(gpu->cmd, gx, gy, gz);
     gpu->dispatches++;
-    int seen = 0;
-    for (int i = 0; i < gpu->nused; i++)
-        if (gpu->used[i] == k) seen = 1;
-    if (!seen) {
-        if (gpu->nused >= MAX_BATCH_KERNELS) return -5;
-        gpu->used[gpu->nused++] = k;
-    }
     return 0;
 }
 
@@ -566,15 +602,27 @@ HA_GPU_API int ha_batch_submit(ha_gpu *gpu) {
     barrier(gpu, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
             VK_ACCESS_HOST_READ_BIT);
     gpu->in_batch = 0;
-    if (gpu->vk.EndCommandBuffer(gpu->cmd) != VK_SUCCESS) return -2;
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &gpu->cmd, 0, 0};
     int rc = 0;
-    if (gpu->vk.QueueSubmit(gpu->queue, 1, &si, gpu->fence) != VK_SUCCESS) rc = -6;
-    else if (gpu->vk.WaitForFences(gpu->device, 1, &gpu->fence, 1, ~0ULL) != VK_SUCCESS) rc = -7;
-    gpu->vk.ResetFences(gpu->device, 1, &gpu->fence);
+    if (gpu->vk.EndCommandBuffer(gpu->cmd) != VK_SUCCESS) {
+        rc = -2;
+    } else {
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &gpu->cmd, 0, 0};
+        if (gpu->vk.QueueSubmit(gpu->queue, 1, &si, gpu->fence) != VK_SUCCESS) {
+            rc = -6;
+        } else {
+            if (gpu->vk.WaitForFences(gpu->device, 1, &gpu->fence, 1, ~0ULL) != VK_SUCCESS) rc = -7;
+            gpu->vk.ResetFences(gpu->device, 1, &gpu->fence);
+        }
+    }
+    /* whatever happened, leave the context ready for the next batch */
     gpu->vk.ResetCommandBuffer(gpu->cmd, 0);
-    for (int i = 0; i < gpu->nused; i++)
-        if (gpu->used[i]->pool) gpu->vk.ResetDescriptorPool(gpu->device, gpu->used[i]->pool, 0);
+    for (int i = 0; i < gpu->nused; i++) {
+        ha_kernel *k = gpu->used[i];
+        for (uint32_t j = 0; j < k->npools && j <= k->cur; j++)
+            gpu->vk.ResetDescriptorPool(gpu->device, k->pools[j], 0);
+        k->cur = 0;
+        k->nsets = 0;
+    }
     gpu->nused = 0;
     return rc;
 }

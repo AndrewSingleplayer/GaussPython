@@ -14,6 +14,7 @@ import subprocess
 
 from . import __version__
 from . import types as T
+from .errors import HappError
 from .gpu import kernel_layout
 
 C_SCALAR = {"bool": "bool", "i8": "int8_t", "u8": "uint8_t", "i16": "int16_t", "u16": "uint16_t",
@@ -216,17 +217,36 @@ def jvm_methods(prog, spirv_kernels, gpu_runtime):
 
 
 def layout_constants(prog):
+    """Kotlin/Java constants: SIZEOF_<STRUCT>, OFFSET_<STRUCT>_<FIELD>, WORKGROUP_<KERNEL>_X.
+    The prefixes keep the three kinds apart; a clash inside one kind is reported."""
     out = []
     for st in prog.structs:
         size, _ = T.size_align(st)
-        out.append((f"{st.name.upper()}_BYTES", size))
+        out.append((f"SIZEOF_{st.name.upper()}", size, f"struct {st.name}", st.loc))
         for (fname, _), off in zip(st.fields, T.field_offsets(st)):
-            out.append((f"{st.name.upper()}_{fname.upper()}", off))
+            out.append((f"OFFSET_{st.name.upper()}_{fname.upper()}", off, f"field {st.name}.{fname}", st.loc))
     for k in prog.kernels:
         wg = k.sig["workgroup"]
         for axis, v in zip("XYZ", wg):
-            out.append((f"{k.name.upper()}_WORKGROUP_{axis}", v))
-    return out
+            out.append((f"WORKGROUP_{k.name.upper()}_{axis}", v, f"kernel {k.name}", k.loc))
+    seen = {}
+    for cname, _, what, loc in out:
+        if cname in seen and seen[cname] != what:
+            raise HappError(f"{what} and {seen[cname]} both give the Kotlin/Java constant {cname}",
+                            loc, "rename one of them")
+        seen[cname] = what
+    return [(cname, v) for cname, v, _, _ in out]
+
+
+def check_kernel_names(prog):
+    """The C header names kernels in upper case (HA_<KERNEL>_BUFFERS...): 'blur' and 'Blur' would clash."""
+    seen = {}
+    for k in prog.kernels:
+        up = k.name.upper()
+        if up in seen:
+            raise HappError(f"kernels '{seen[up]}' and '{k.name}' differ only in upper/lower case; "
+                            f"generated C/Kotlin/Java names would clash", k.loc, "rename one of them")
+        seen[up] = k.name
 
 
 def render_kotlin(prog, src, name, package, cls, spirv_kernels, gpu_runtime):
@@ -511,6 +531,7 @@ def write_bridges(prog, out_dir, name, package, cls, targets, produced, tc, meta
     src = src or f"{name}.ha"
     files = {}
     has_metal = metal_src is not None and any(t.startswith(("ios", "macos")) for t in targets)
+    check_kernel_names(prog)
     header_text = CHeader(prog).render(name, src, set(spirv_kernels), has_metal, gpu_runtime)
     inc = os.path.join(out_dir, "include")
     os.makedirs(inc, exist_ok=True)

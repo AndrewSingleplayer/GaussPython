@@ -46,7 +46,8 @@ kernels. Order does not matter.
 
 **Literals take their type from context.** In `x * 2.0`, the `2.0` becomes
 `f16` when `x` is `f16`. `let n: u8 = 200` works; `let n: u8 = 300` is an
-error. Without context, an integer is `i32` and a decimal is `f32`.
+error. Without context, an integer is `i32` (`i64` or `u64` if it doesn't fit)
+and a decimal is `f32`. A float literal too big for its type is an error.
 
 HA++ has no literal suffixes. Write `1.0 as f16` instead of `1.0h`.
 
@@ -55,6 +56,11 @@ const TILE: u32 = 16;          // typed constant
 const SCALE = 0.5;             // untyped: adapts like a literal
 const N = TILE * 4;            // constant expressions are evaluated at compile time
 ```
+
+Constant expressions follow the same rules as run-time code for their type:
+integers wrap, shift amounts are masked, integer division truncates, and casts
+saturate. Dividing by zero in a constant is a compile error. A constant can
+only use other constants, not variables.
 
 ## Variables
 
@@ -138,13 +144,23 @@ From lowest to highest precedence:
 | `&` | bitwise and |
 | `<< >>` | shift amount is masked to the type width; `>>` is arithmetic for signed types |
 | `+ -` | also pointer + integer |
-| `* / %` | `%` on floats is `x - y*trunc(x/y)` (C `fmod`) |
+| `* / %` | integer `/` and `%` never trap, see below; `%` on floats is `x - y*trunc(x/y)` |
 | `as` | conversion |
 | unary `- ! ~ & *` | negate, not, bit-not, address-of, dereference |
 | `f(x)  a[i]  a.b` | call, index, field / swizzle |
 
 Both operands must have the same type. The exceptions are vector × scalar and
 matrix × vector/scalar.
+
+**Integer division is defined for every input**, on the CPU and on GPUs:
+`x / 0 = 0`, `x % 0 = x`, `MIN / -1 = MIN` and `MIN % -1 = 0` (`MIN` is the
+most negative value, e.g. `-2147483648` for `i32`). A constant divisor costs
+nothing extra.
+
+**Float `%` and `mod`** use an exact division, so the result is exact as long as
+`|x / y| < 2^23`. For larger ratios the compiler may fuse `y * trunc(x/y)` and
+the subtraction into one instruction. The result is then still close relative
+to `x`, but it can differ between CPUs, like any fast-math result.
 
 ## Conversions
 
@@ -270,16 +286,20 @@ So one buffer of structs has the same bytes on:
 - Vulkan: the generated GLSL uses std430 with scalar-only members;
 - Metal: the generated code uses `packed_float3` and similar types.
 
-The generated header checks every struct size with `static_assert`, and the
-Kotlin/Java class has `NAME_BYTES` and `NAME_FIELD` offset constants.
+The generated header checks every struct size with `static_assert`. The
+Kotlin/Java class has `SIZEOF_NAME` and `OFFSET_NAME_FIELD` constants, plus
+`WORKGROUP_KERNEL_X/Y/Z`. Two names that would give the same constant, such as
+struct `a_b` field `c` and struct `a` field `b_c`, are a build error.
 
 ## CPU vs GPU differences
 
 | | CPU | GPU |
 |---|---|---|
 | float → int out of range | saturates | undefined |
-| integer division by zero | undefined (like C) | undefined |
+| integer division by 0 or `MIN / -1` | defined (see Operators) | the same, guarded in the generated code |
 | `exp`, `sin`, … | HA++ std library (≤ a few ulp) | GPU instructions (driver precision) |
+| f16 math functions (`sqrt`, `dot`, `round`, …) | f16 | Vulkan: computed in f32, then rounded to f16 (can be more precise than the CPU); Metal: native `half` |
+| `atomic_*` inside `a[...] += x` or `select` | runs once | runs once (the index is computed once, into a temporary) |
 | fast-math | on (`@strict` to disable) | the GPU compiler's own rules |
 
 ## Imports and names
@@ -290,3 +310,10 @@ import "common.ha";     // path relative to this file; everything shares one nam
 
 A name can't be used twice. User definitions replace std-library definitions
 with the same name. Built-in names like `dot` or `exp` can't be redefined.
+
+Names are ASCII letters, digits and `_`. Some names end up in generated C,
+Swift, Kotlin, Java, Python and Metal code: exported functions, kernels, their
+parameters, structs and fields. These can't be a keyword of any of those
+languages (`class`, `default`, `val`, `self`, `device`, …), because the
+generated code would not compile. The compiler says which language reserves the
+name.
