@@ -1,0 +1,292 @@
+# HA++ language reference (v0.1)
+
+HA++ is statically typed, compiled ahead of time, and has no garbage collector
+or hidden runtime. A file (`.ha`) contains structs, constants, functions and
+kernels. Order does not matter.
+
+## Contents
+
+1. [Types](#types)
+2. [Literals and constants](#literals-and-constants)
+3. [Variables](#variables)
+4. [Functions](#functions)
+5. [Structs, arrays, pointers](#structs-arrays-pointers)
+6. [Vectors and matrices](#vectors-and-matrices)
+7. [Operators](#operators)
+8. [Conversions](#conversions)
+9. [Control flow](#control-flow)
+10. [GPU kernels](#gpu-kernels)
+11. [Built-in functions](#built-in-functions)
+12. [Standard library](#standard-library-happstdmathha)
+13. [Attributes](#attributes)
+14. [Memory layout](#memory-layout)
+15. [CPU vs GPU differences](#cpu-vs-gpu-differences)
+16. [Imports and names](#imports-and-names)
+
+## Types
+
+| Type | Meaning |
+|---|---|
+| `bool` | true / false (1 byte in memory) |
+| `i8 i16 i32 i64` | signed integers; overflow wraps |
+| `u8 u16 u32 u64` | unsigned integers |
+| `f16 f32 f64` | half, single, double precision floats |
+| `vec2 vec3 vec4` | f32 vectors |
+| `ivec2..4` / `uvec2..4` / `hvec2..4` | i32 / u32 / f16 vectors |
+| `mat2 mat3 mat4` | f32 square matrices, column-major |
+| `[N]T` | fixed array, e.g. `[16]f32`, `[4][3]i32` |
+| `*T` | pointer to `T` (memory owned by the host app) |
+| `struct Name { … }` | C-compatible struct |
+
+## Literals and constants
+
+```rust
+42        0xFF_FF      0b1010      1.5      2.0e-3      true      "text"
+```
+
+**Literals take their type from context.** In `x * 2.0`, the `2.0` becomes
+`f16` when `x` is `f16`. `let n: u8 = 200` works; `let n: u8 = 300` is an
+error. Without context, an integer is `i32` and a decimal is `f32`.
+
+HA++ has no literal suffixes. Write `1.0 as f16` instead of `1.0h`.
+
+```rust
+const TILE: u32 = 16;          // typed constant
+const SCALE = 0.5;             // untyped: adapts like a literal
+const N = TILE * 4;            // constant expressions are evaluated at compile time
+```
+
+## Variables
+
+```rust
+let a = 1.0;              // immutable, type inferred (f32)
+let b: u32 = 7;
+var c = vec3(0.0);        // mutable
+var d: [8]f32;            // zero-initialized
+c.x += 1.0;               // compound assignment: += -= *= /= %= &= |= ^= <<= >>=
+```
+
+Every variable is initialized. `var x: T;` is all zeros.
+
+## Functions
+
+```rust
+fn lerp3(a: vec3, b: vec3, t: f32) -> vec3 { return a + (b - a) * t; }   // private
+export fn process(data: *f32, n: i64) { ... }    // C ABI, visible to Swift/Kotlin/C/Python
+extern fn my_c_function(x: f32) -> f32;          // implemented by the host app (C ABI)
+fn main() { ... }                                // only for `happ run`
+fn main() -> i32 { return 0; }
+```
+
+- **Parameters:** they are read-only values. Structs and arrays are passed
+  by value. The compiler avoids the copies when it can.
+- **`export` functions:** they take and return only numbers, `bool` and
+  pointers, the C ABI subset every language can call. Pass structs as `*T`.
+- **Names:** there is no overloading.
+- **Recursion:** it is allowed on the CPU but not in code reached from a
+  kernel.
+- **Missing returns:** a function that can reach its end without returning a
+  value is a compile error.
+
+## Structs, arrays, pointers
+
+```rust
+struct Gaussian { pos: vec3, scale: vec3, rot: vec4, opacity: f32, sh: [3]f32 }
+
+let g = Gaussian(pos: vec3(0.0), opacity: 1.0);      // named: missing fields are zero
+let h = Gaussian(p, s, r, 0.5, [0.1, 0.2, 0.3]);     // positional: all fields
+var arr = [1.0, 2.0, 3.0];                           // [3]f32
+arr[1] = 5.0;
+
+export fn f(gs: *Gaussian, n: i64) {
+    gs[0].opacity = 0.0;          // index a pointer
+    gs.opacity = 0.0;             // pointer to struct: same as gs[0].opacity
+    let second = gs + 1;          // pointer arithmetic (in elements)
+    let p = &arr[2];              // address of a 'var' (or of an element / field)
+    let bytes = gs as *u8;        // pointer casts
+    let addr = gs as u64;
+}
+```
+
+## Vectors and matrices
+
+```rust
+let v = vec3(1.0, 2.0, 3.0);
+let w = vec4(v, 1.0);            // components from vectors and scalars
+let s = vec3(0.5);               // splat
+v.x   v.xy   v.zyx   v.rgb       // swizzles: xyzw or rgba, up to 4
+var u = v;  u.xz = vec2(9.0, 8.0);  u[1] = 7.0;      // write lanes
+v * 2.0   v + w.xyz   max(v, 0.0)                    // lane-wise, scalars broadcast
+
+let m = mat3(1.0);                                   // identity (diagonal)
+let r = mat3(col0, col1, col2);                      // from columns
+let q = mat2(1.0, 2.0, 3.0, 4.0);                    // 4 scalars, column-major
+m * v    m * m    transpose(m)    m[2] (column)    m[2].y
+```
+
+## Operators
+
+From lowest to highest precedence:
+
+| Operators | Notes |
+|---|---|
+| `\|\|` | short-circuit |
+| `&&` | short-circuit |
+| `== != < > <= >=` | can't be chained (`a < b < c` is an error) |
+| `\|` | bitwise (bools too) |
+| `^` | bitwise xor |
+| `&` | bitwise and |
+| `<< >>` | shift amount is masked to the type width; `>>` is arithmetic for signed types |
+| `+ -` | also pointer + integer |
+| `* / %` | `%` on floats is `x - y*trunc(x/y)` (C `fmod`) |
+| `as` | conversion |
+| unary `- ! ~ & *` | negate, not, bit-not, address-of, dereference |
+| `f(x)  a[i]  a.b` | call, index, field / swizzle |
+
+Both operands must have the same type. The exceptions are vector × scalar and
+matrix × vector/scalar.
+
+## Conversions
+
+Conversions are only ever explicit, with `x as T`:
+
+- **number ↔ number:**
+  - Float → integer rounds toward zero and **saturates**: `1e10 as i32` =
+    `2147483647`, `NaN as i32` = `0`. This matches Rust, and ARM64 does it in
+    hardware.
+  - Wider → narrower integers wrap.
+- **bool → integer:** allowed. For the other direction, write `x != 0`.
+- **vector ↔ vector:** same length, converted lane by lane: `vec3 as ivec3`.
+- **pointers:** `*T ↔ *U`, and `*T ↔ u64/i64`.
+- **raw bits:** `f32_bits(x)`, `f32_from_bits(u)`, plus the same for f16/f64.
+
+## Control flow
+
+```rust
+if a > b { ... } else if a == b { ... } else { ... }
+while cond { ... }
+for i in 0..n { ... }            // i goes from 0 to n-1; the end is evaluated once
+for j: u32 in 0..16 { ... }      // choose the loop variable type
+break;  continue;  return x;
+let y = select(c, a, b);         // branch-free choice (both sides are evaluated)
+```
+
+Conditions must be `bool`. Integers are not truthy.
+
+## GPU kernels
+
+```rust
+@workgroup(64)                  // threads per workgroup: 1-3 sizes, default 64
+kernel scale(data: *vec4, n: u32, k: f32) {
+    let i = global_id.x;        // uvec3: global_id, local_id, group_id, num_groups, group_size
+    if i >= n { return; }       // 'return' ends this thread
+    data[i] = data[i] * k;
+}
+```
+
+**Parameters:**
+- Pointer parameters are GPU buffers. On Vulkan they are bindings 0, 1, 2…
+  in order; on Metal they are `[[buffer(i)]]`.
+- Scalar parameters (`i32`, `u32`, `f32`) are push constants on Vulkan. On
+  Metal they are one constant struct at the next buffer index. The generated
+  header describes it as `ha_params_<kernel>`.
+
+**What kernels can use:**
+- Types: `i32`, `u32`, `f32`, `f16`, `bool`, vectors, matrices, and structs
+  and arrays of those.
+- Other functions: helper functions called from a kernel are compiled for the
+  GPU too. They can't take pointers.
+- Not allowed: `print`, `extern`, pointer arithmetic, `&`, 64-bit types and
+  recursion.
+
+**GPU-only features:**
+
+```rust
+shared tile: [256]f32;               // workgroup memory (top of the kernel body)
+barrier();                           // wait for the whole workgroup (+ shared memory fence)
+atomic_add(counts, idx, 1);          // also atomic_min / atomic_max / atomic_exchange;
+                                     // on *i32/*u32 buffers or shared i32/u32 arrays; returns old value
+subgroup_add(x)  subgroup_exclusive_add(x)  subgroup_lane()  subgroup_size()
+```
+
+**Every kernel also runs on the CPU.** A kernel that uses none of `shared`,
+`barrier` or `subgroup_*` also gets a CPU version:
+`<kernel>_cpu(params…, groups_x, groups_y, groups_z)`. It runs every
+workgroup on the calling thread. If you define your own `<kernel>_cpu`
+function, HA++ uses yours instead.
+
+## Built-in functions
+
+| Group | Functions |
+|---|---|
+| Float math (scalars & vectors) | `sqrt rsqrt exp exp2 log log2 pow sin cos tan asin acos atan atan2 tanh` |
+| Rounding | `floor ceil round trunc fract mod` (`round`: halves away from zero; `mod`: GLSL-style `x - y*floor(x/y)`) |
+| Common | `abs sign min max clamp mix step smoothstep fma select` |
+| Geometry | `dot cross length distance normalize transpose` |
+| Bits | `popcount clz ctz f32_bits f32_from_bits f16_bits f16_from_bits f64_bits f64_from_bits` |
+| Packing | `pack_half2(vec2) -> u32`, `unpack_half2(u32) -> vec2` |
+| GPU | `barrier atomic_add atomic_min atomic_max atomic_exchange subgroup_*` |
+| Debug | `print(a, b, …)`: prints in `happ run`; ignored in libraries (with a build note) |
+
+On CPUs the transcendental functions are the HA++ standard library: accurate
+to a few ulp, with no libm. On GPUs they are the GPU's own instructions, which
+are faster and slightly less accurate.
+
+## Standard library (`happ/std/math.ha`)
+
+These are always available:
+- **Constants:** `PI`, `TAU`, `E`.
+- **Activation functions:** `sigmoid`, `relu`, `silu`, `softplus`, `gelu`
+  (tanh form).
+- **Small helpers:** `saturate`, `radians`, `degrees`.
+- **Rotation:** `quat_to_mat3(vec4(w, x, y, z))`.
+- **Colour packing:** `pack_unorm4(vec4) -> u32` and `unpack_unorm4(u32) -> vec4`
+  (RGBA8).
+
+If you define a function or constant with the same name, yours is used.
+
+## Attributes
+
+| Attribute | On | Effect |
+|---|---|---|
+| `@workgroup(x, y, z)` | kernel | threads per workgroup |
+| `@inline` / `@noinline` | fn | inlining hint |
+| `@strict` | fn | exact IEEE float math (no fast-math) in this function; `happ build --strict-math` for everything |
+
+## Memory layout
+
+Every type is laid out like the matching C type. Vectors and matrices are
+**tightly packed floats**:
+
+| Type | Layout |
+|---|---|
+| `vec3` | 12 bytes, alignment 4 |
+| `vec4` | 16 bytes, alignment 4 |
+| `mat4` | 64 bytes, column-major |
+| `f16` | 2 bytes |
+
+So one buffer of structs has the same bytes on:
+- the CPU: C, Swift, Kotlin `ByteBuffer`, Python `ctypes`/NumPy;
+- Vulkan: the generated GLSL uses std430 with scalar-only members;
+- Metal: the generated code uses `packed_float3` and similar types.
+
+The generated header checks every struct size with `static_assert`, and the
+Kotlin/Java class has `NAME_BYTES` and `NAME_FIELD` offset constants.
+
+## CPU vs GPU differences
+
+| | CPU | GPU |
+|---|---|---|
+| float → int out of range | saturates | undefined |
+| integer division by zero | undefined (like C) | undefined |
+| `exp`, `sin`, … | HA++ std library (≤ a few ulp) | GPU instructions (driver precision) |
+| fast-math | on (`@strict` to disable) | the GPU compiler's own rules |
+
+## Imports and names
+
+```rust
+import "common.ha";     // path relative to this file; everything shares one namespace
+```
+
+A name can't be used twice. User definitions replace std-library definitions
+with the same name. Built-in names like `dot` or `exp` can't be redefined.

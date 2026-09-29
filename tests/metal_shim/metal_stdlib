@@ -1,0 +1,265 @@
+// Test-only stand-in for <metal_stdlib>, so generated Metal kernels can be
+// compiled and *executed* with clang++ on Linux/Windows. It implements the
+// subset of the Metal Shading Language that the HA++ generator emits.
+// This checks our generated code (syntax, types, math); it is not Apple's compiler.
+#pragma once
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+#define kernel
+#define device
+#define constant
+#define threadgroup
+#define thread
+
+namespace metal {
+typedef _Float16 half;
+typedef unsigned int uint;
+
+#define HA_VT(name, T, N) typedef T name __attribute__((ext_vector_type(N)));
+HA_VT(float2, float, 2) HA_VT(float3, float, 3) HA_VT(float4, float, 4)
+HA_VT(int2, int, 2) HA_VT(int3, int, 3) HA_VT(int4, int, 4)
+HA_VT(uint2, uint, 2) HA_VT(uint3, uint, 3) HA_VT(uint4, uint, 4)
+HA_VT(half2, half, 2) HA_VT(half3, half, 3) HA_VT(half4, half, 4)
+
+template <class V> struct vt;
+#define HA_TR(V, E, n) template <> struct vt<V> { typedef E elem; enum { N = n }; };
+HA_TR(float2, float, 2) HA_TR(float3, float, 3) HA_TR(float4, float, 4)
+HA_TR(int2, int, 2) HA_TR(int3, int, 3) HA_TR(int4, int, 4)
+HA_TR(uint2, uint, 2) HA_TR(uint3, uint, 3) HA_TR(uint4, uint, 4)
+HA_TR(half2, half, 2) HA_TR(half3, half, 3) HA_TR(half4, half, 4)
+
+template <class T, int N, class V> struct packed_vec {
+    T v[N];
+    packed_vec() = default;
+    packed_vec(V x) { for (int i = 0; i < N; i++) v[i] = x[i]; }
+    operator V() const { V r; for (int i = 0; i < N; i++) r[i] = v[i]; return r; }
+    T &operator[](int i) { return v[i]; }
+    const T &operator[](int i) const { return v[i]; }
+};
+typedef packed_vec<float, 2, float2> packed_float2;
+typedef packed_vec<float, 3, float3> packed_float3;
+typedef packed_vec<float, 4, float4> packed_float4;
+typedef packed_vec<int, 2, int2> packed_int2;
+typedef packed_vec<int, 3, int3> packed_int3;
+typedef packed_vec<int, 4, int4> packed_int4;
+typedef packed_vec<uint, 2, uint2> packed_uint2;
+typedef packed_vec<uint, 3, uint3> packed_uint3;
+typedef packed_vec<uint, 4, uint4> packed_uint4;
+typedef packed_vec<half, 2, half2> packed_half2;
+typedef packed_vec<half, 3, half3> packed_half3;
+typedef packed_vec<half, 4, half4> packed_half4;
+
+template <class T, int N> using array = std::array<T, N>;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuser-defined-literals"
+inline half operator"" h(long double x) { return (half)x; }
+inline half operator"" h(unsigned long long x) { return (half)x; }
+#pragma clang diagnostic pop
+
+// ---- vector construction: float3(a, b, c), float4(v3, w), float3(s), float3(int3) ...
+template <class E> inline void ha_push(E *buf, int &k, float x) { buf[k++] = (E)x; }
+template <class E> inline void ha_push(E *buf, int &k, double x) { buf[k++] = (E)x; }
+template <class E> inline void ha_push(E *buf, int &k, int x) { buf[k++] = (E)x; }
+template <class E> inline void ha_push(E *buf, int &k, uint x) { buf[k++] = (E)x; }
+template <class E> inline void ha_push(E *buf, int &k, half x) { buf[k++] = (E)x; }
+template <class E> inline void ha_push(E *buf, int &k, bool x) { buf[k++] = (E)x; }
+template <class E, class V, class = typename vt<V>::elem> inline void ha_push(E *buf, int &k, V x) {
+    for (int i = 0; i < vt<V>::N; i++) buf[k++] = (E)x[i];
+}
+template <class E, class T, int N, class V> inline void ha_push(E *buf, int &k, packed_vec<T, N, V> x) {
+    ha_push<E>(buf, k, (V)x);
+}
+template <class V, class... A> inline V ha_make(A... a) {
+    typedef typename vt<V>::elem E;
+    E buf[16];
+    int k = 0;
+    (ha_push<E>(buf, k, a), ...);
+    V r;
+    for (int i = 0; i < vt<V>::N; i++) r[i] = (k == 1) ? buf[0] : buf[i];
+    return r;
+}
+
+// ---- square float matrices, column-major
+template <int N> struct fmat {
+    typedef float col_t __attribute__((ext_vector_type(N)));
+    col_t c[N];
+    col_t &operator[](int i) { return c[i]; }
+    const col_t &operator[](int i) const { return c[i]; }
+};
+typedef fmat<2> float2x2;
+typedef fmat<3> float3x3;
+typedef fmat<4> float4x4;
+template <int N> inline fmat<N> ha_mat_diag(float s) {
+    fmat<N> m;
+    for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) m.c[i][j] = (i == j) ? s : 0.0f;
+    return m;
+}
+template <int N, class... A> inline fmat<N> ha_make_mat(A... a) {
+    if constexpr (sizeof...(A) == 1) {
+        return ha_mat_diag<N>((float)(a, ...));
+    } else if constexpr (sizeof...(A) == N) {
+        fmat<N> m;
+        int i = 0;
+        ((m.c[i++] = a), ...);
+        return m;
+    } else {
+        float buf[N * N];
+        int k = 0;
+        ((buf[k++] = (float)a), ...);
+        fmat<N> m;
+        for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) m.c[i][j] = buf[i * N + j];
+        return m;
+    }
+}
+template <int N> inline typename fmat<N>::col_t operator*(const fmat<N> &m, typename fmat<N>::col_t v) {
+    typename fmat<N>::col_t r = m.c[0] * v[0];
+    for (int i = 1; i < N; i++) r += m.c[i] * v[i];
+    return r;
+}
+template <int N> inline fmat<N> operator*(const fmat<N> &a, const fmat<N> &b) {
+    fmat<N> r;
+    for (int i = 0; i < N; i++) r.c[i] = a * b.c[i];
+    return r;
+}
+template <int N> inline fmat<N> operator*(const fmat<N> &a, float s) {
+    fmat<N> r;
+    for (int i = 0; i < N; i++) r.c[i] = a.c[i] * s;
+    return r;
+}
+template <int N> inline fmat<N> operator*(float s, const fmat<N> &a) { return a * s; }
+template <int N> inline fmat<N> operator/(const fmat<N> &a, float s) { return a * (1.0f / s); }
+template <int N> inline fmat<N> operator+(const fmat<N> &a, const fmat<N> &b) {
+    fmat<N> r;
+    for (int i = 0; i < N; i++) r.c[i] = a.c[i] + b.c[i];
+    return r;
+}
+template <int N> inline fmat<N> operator-(const fmat<N> &a, const fmat<N> &b) {
+    fmat<N> r;
+    for (int i = 0; i < N; i++) r.c[i] = a.c[i] - b.c[i];
+    return r;
+}
+template <int N> inline fmat<N> operator-(const fmat<N> &a) { return a * -1.0f; }
+template <int N> inline fmat<N> transpose(const fmat<N> &a) {
+    fmat<N> r;
+    for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) r.c[i][j] = a.c[j][i];
+    return r;
+}
+
+// ---- math: scalar versions + lane-wise vector versions
+#define HA_MAP1(fn, expr)                                                                          \
+    inline float fn(float x) { return expr; }                                                      \
+    inline half fn(half hx) { float x = (float)hx; return (half)(expr); }                          \
+    template <class V, class = typename vt<V>::elem> inline V fn(V v) {                            \
+        V r;                                                                                       \
+        for (int i = 0; i < vt<V>::N; i++) r[i] = fn(v[i]);                                        \
+        return r;                                                                                  \
+    }
+HA_MAP1(sqrt, std::sqrt(x)) HA_MAP1(rsqrt, 1.0f / std::sqrt(x)) HA_MAP1(exp, std::exp(x))
+HA_MAP1(exp2, std::exp2(x)) HA_MAP1(log, std::log(x)) HA_MAP1(log2, std::log2(x))
+HA_MAP1(sin, std::sin(x)) HA_MAP1(cos, std::cos(x)) HA_MAP1(tan, std::tan(x))
+HA_MAP1(asin, std::asin(x)) HA_MAP1(acos, std::acos(x)) HA_MAP1(atan, std::atan(x))
+HA_MAP1(tanh, std::tanh(x)) HA_MAP1(floor, std::floor(x)) HA_MAP1(ceil, std::ceil(x))
+HA_MAP1(trunc, std::trunc(x)) HA_MAP1(round, std::round(x)) HA_MAP1(fract, x - std::floor(x))
+HA_MAP1(sign, (float)((x > 0.0f) - (x < 0.0f)))
+
+#define HA_MAP2(fn, expr)                                                                          \
+    inline float fn(float x, float y) { return expr; }                                             \
+    inline half fn(half hx, half hy) { float x = (float)hx, y = (float)hy; return (half)(expr); }  \
+    template <class V, class = typename vt<V>::elem> inline V fn(V a, V b) {                       \
+        V r;                                                                                       \
+        for (int i = 0; i < vt<V>::N; i++) r[i] = fn(a[i], b[i]);                                  \
+        return r;                                                                                  \
+    }
+HA_MAP2(pow, std::pow(x, y)) HA_MAP2(atan2, std::atan2(x, y)) HA_MAP2(fmod, std::fmod(x, y))
+HA_MAP2(step, (float)(y >= x))
+
+inline int abs(int x) { return x < 0 ? -x : x; }
+inline float abs(float x) { return std::fabs(x); }
+inline half abs(half x) { return x < (half)0 ? -x : x; }
+template <class V, class = typename vt<V>::elem> inline V abs(V v) {
+    V r;
+    for (int i = 0; i < vt<V>::N; i++) r[i] = abs(v[i]);
+    return r;
+}
+template <class T> inline T min(T a, T b) { return b < a ? b : a; }
+template <class T> inline T max(T a, T b) { return a < b ? b : a; }
+#define HA_VMINMAX(V)                                                                              \
+    inline V min(V a, V b) { V r; for (int i = 0; i < vt<V>::N; i++) r[i] = min(a[i], b[i]); return r; } \
+    inline V max(V a, V b) { V r; for (int i = 0; i < vt<V>::N; i++) r[i] = max(a[i], b[i]); return r; }
+HA_VMINMAX(float2) HA_VMINMAX(float3) HA_VMINMAX(float4) HA_VMINMAX(int2) HA_VMINMAX(int3)
+HA_VMINMAX(int4) HA_VMINMAX(uint2) HA_VMINMAX(uint3) HA_VMINMAX(uint4) HA_VMINMAX(half2)
+HA_VMINMAX(half3) HA_VMINMAX(half4)
+template <class T> inline T clamp(T x, T lo, T hi) { return min(max(x, lo), hi); }
+template <class T, class S> inline T mix(T a, T b, S t) { return a + (b - a) * t; }
+template <class T> inline T fma(T a, T b, T c) { return a * b + c; }
+template <class T> inline T smoothstep(T e0, T e1, T x) {
+    T t = clamp((x - e0) / (e1 - e0), (T)0.0f, (T)1.0f);
+    return t * t * ((T)3.0f - (T)2.0f * t);
+}
+template <class V, class = typename vt<V>::elem> inline typename vt<V>::elem dot(V a, V b) {
+    typename vt<V>::elem s = 0;
+    for (int i = 0; i < vt<V>::N; i++) s += a[i] * b[i];
+    return s;
+}
+template <class V> inline typename vt<V>::elem length(V a) { return sqrt(dot(a, a)); }
+template <class V> inline typename vt<V>::elem distance(V a, V b) { return length(a - b); }
+template <class V> inline V normalize(V a) { return a / length(a); }
+inline float3 cross(float3 a, float3 b) { return a.yzx * b.zxy - a.zxy * b.yzx; }
+inline half3 cross(half3 a, half3 b) { return a.yzx * b.zxy - a.zxy * b.yzx; }
+inline uint popcount(uint x) { return (uint)__builtin_popcount(x); }
+inline uint clz(uint x) { return x ? (uint)__builtin_clz(x) : 32u; }
+inline uint ctz(uint x) { return x ? (uint)__builtin_ctz(x) : 32u; }
+inline int popcount(int x) { return __builtin_popcount((uint)x); }
+inline int clz(int x) { return x ? __builtin_clz((uint)x) : 32; }
+inline int ctz(int x) { return x ? __builtin_ctz((uint)x) : 32; }
+
+template <class T, class F> inline T as_type(F x) {
+    static_assert(sizeof(T) == sizeof(F), "as_type size");
+    T r;
+    std::memcpy(&r, &x, sizeof r);
+    return r;
+}
+
+// ---- atomics and synchronization (single-threaded emulation)
+typedef std::atomic<uint> atomic_uint;
+typedef std::atomic<int> atomic_int;
+using std::memory_order_relaxed;
+template <class A, class T> inline T atomic_fetch_add_explicit(A *p, T v, std::memory_order o) { return p->fetch_add(v, o); }
+template <class A, class T> inline T atomic_exchange_explicit(A *p, T v, std::memory_order o) { return p->exchange(v, o); }
+template <class A, class T> inline T atomic_fetch_min_explicit(A *p, T v, std::memory_order) {
+    T old = p->load();
+    if (v < old) p->store(v);
+    return old;
+}
+template <class A, class T> inline T atomic_fetch_max_explicit(A *p, T v, std::memory_order) {
+    T old = p->load();
+    if (v > old) p->store(v);
+    return old;
+}
+enum class mem_flags { mem_none = 0, mem_threadgroup = 1, mem_device = 2 };
+inline void threadgroup_barrier(mem_flags) {}
+template <class T> inline T simd_sum(T x) { return x; }
+template <class T> inline T simd_prefix_exclusive_sum(T x) { return (T)0; }
+}  // namespace metal
+
+// Metal's function-style vector/matrix constructors
+#define float2(...) ::metal::ha_make<::metal::float2>(__VA_ARGS__)
+#define float3(...) ::metal::ha_make<::metal::float3>(__VA_ARGS__)
+#define float4(...) ::metal::ha_make<::metal::float4>(__VA_ARGS__)
+#define int2(...) ::metal::ha_make<::metal::int2>(__VA_ARGS__)
+#define int3(...) ::metal::ha_make<::metal::int3>(__VA_ARGS__)
+#define int4(...) ::metal::ha_make<::metal::int4>(__VA_ARGS__)
+#define uint2(...) ::metal::ha_make<::metal::uint2>(__VA_ARGS__)
+#define uint3(...) ::metal::ha_make<::metal::uint3>(__VA_ARGS__)
+#define uint4(...) ::metal::ha_make<::metal::uint4>(__VA_ARGS__)
+#define half2(...) ::metal::ha_make<::metal::half2>(__VA_ARGS__)
+#define half3(...) ::metal::ha_make<::metal::half3>(__VA_ARGS__)
+#define half4(...) ::metal::ha_make<::metal::half4>(__VA_ARGS__)
+#define float2x2(...) ::metal::ha_make_mat<2>(__VA_ARGS__)
+#define float3x3(...) ::metal::ha_make_mat<3>(__VA_ARGS__)
+#define float4x4(...) ::metal::ha_make_mat<4>(__VA_ARGS__)
