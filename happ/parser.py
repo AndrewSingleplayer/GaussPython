@@ -91,6 +91,9 @@ class Parser:
     def parse_item(self):
         attrs = self.parse_attrs()
         t = self.tok
+        if attrs and not (t.kind == "kw" and t.value in ("fn", "export", "kernel", "extern")):
+            first = next(iter(attrs.values()))[1]
+            raise HappError("attributes (@...) can only be used on functions and kernels", first)
         if t.kind == "kw":
             if t.value == "import":
                 self.advance()
@@ -271,7 +274,8 @@ class Parser:
         while self.tok.kind == "op" and self.tok.value in ops:
             opt = self.advance()
             right = self.parse_expr(level + 1)
-            if opt.value in COMPARISONS and isinstance(left, A.Binary) and left.op in COMPARISONS:
+            if opt.value in COMPARISONS and isinstance(left, A.Binary) and left.op in COMPARISONS \
+                    and not left.paren:
                 raise HappError("comparisons cannot be chained; use '&&'", opt.loc)
             left = A.Binary(opt.value, left, right, opt.loc)
         return left
@@ -345,6 +349,8 @@ class Parser:
         if self.accept("op", "("):
             e = self.parse_expr()
             self.expect_op(")")
+            if isinstance(e, A.Binary):
+                e.paren = True
             return e
         if self.accept("op", "["):
             elems = []

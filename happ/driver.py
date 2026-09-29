@@ -433,10 +433,15 @@ def main(argv=None):
     p.set_defaults(func=cmd_doctor)
 
     args = ap.parse_args(argv)
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
     try:
         args.func(args)
     except HappError as e:
         print(e, file=sys.stderr)
+        sys.exit(1)
+    except RecursionError:
+        print("error: the program is nested too deeply (simplify the expression or split it into steps)",
+              file=sys.stderr)
         sys.exit(1)
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)

@@ -16,7 +16,7 @@ Android NDK.
 
 ![Gaussian splats rendered by the HA++ pipeline](docs/images/galaxy.png)
 
-*30,000 Gaussian splats, rendered by `examples/splat/splat.ha`: projection,
+*30,000 Gaussian splats, rendered by `gaussian/splat.ha`: projection,
 GPU radix sort and tile rasterizer, all written in HA++. This image was made
 on a Linux server with the software Vulkan driver (lavapipe). An Android
 phone runs the same `.so`.*
@@ -44,10 +44,10 @@ For GPU kernels, also install `glslangValidator` (Vulkan SDK, or `apt install gl
 ```sh
 ./happ.sh doctor                        # which tools were found   (Windows: happ doctor)
 ./happ.sh run examples/hello.ha         # compile + run on this PC
-./happ.sh build examples/splat/splat.ha -t phones    # Android + iPhone libraries
+./happ.sh build gaussian/splat.ha -t phones    # Android + iPhone libraries
 ./happ.sh build my.ha -t all            # all 11 targets
 ./happ.sh emit my.ha asm -t android-arm64            # see the ARM64 assembly
-python3 examples/splat/render.py --out splats.png    # render splats on this PC's GPU
+python3 gaussian/render.py --out splats.png    # render splats on this PC's GPU
 ```
 
 ## A taste of the language
@@ -85,7 +85,7 @@ kernel fade_gpu(s: *Splat, n: u32, k: f32) {
 | `happ/` | the compiler: lexer, parser, type checker, LLVM backend, GPU backend (GLSL/Metal), bridges, build driver |
 | `happ/std/math.ha` | standard library written in HA++: exp/log/sin/cos/tanh/pow…, sigmoid/gelu, quaternions, color packing |
 | `runtime/gpu/` | Vulkan GPU runtime in C. It compiles with plain clang (no SDK) and is linked into Android/Windows/Linux libraries |
-| `examples/splat/` | Gaussian splat renderer for AR, with hosts in Python (PC), Java (Android) and Swift (iPhone) |
+| `gaussian/` | Gaussian splat renderer for AR, with hosts in Python (PC), Java (Android) and Swift (iPhone) |
 | `examples/ai/nn.ha` | matmul, softmax, layer norm, GELU: a transformer MLP block on GPU and CPU |
 | `tests/` | test suite (see below) |
 | `bench/bench.py` | speed comparison with C and NumPy |

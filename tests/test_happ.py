@@ -22,7 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.join(ROOT, "tests")
 sys.path.insert(0, ROOT)
 sys.path.insert(0, TESTS)
-sys.path.insert(0, os.path.join(ROOT, "examples", "splat"))
+sys.path.insert(0, os.path.join(ROOT, "gaussian"))
 
 from happ.checker import check  # noqa: E402
 from happ.driver import build, load_program, main as happ_main  # noqa: E402
@@ -355,7 +355,7 @@ class GPU(TempDirCase):
 
     @unittest.skipUnless(have("javac", "java"), "needs a JDK")
     def test_android_splat_renderer_from_java(self):
-        """examples/splat/android/SplatRenderer.java must render exactly what the Python host renders."""
+        """gaussian/android/SplatRenderer.java must render exactly what the Python host renders."""
         import render as R
         out = os.path.join(self.tmp, "sb")
         lib = R.build(out_dir=out)
@@ -370,7 +370,7 @@ class GPU(TempDirCase):
         img, _ = pipe.render(cam, w, h, background=(8, 10, 22))
         classes = os.path.join(self.tmp, "classes")
         subprocess.run(["javac", "-d", classes, os.path.join(out, "android", "java", "com", "happ", "splat", "Splat.java"),
-                        os.path.join(ROOT, "examples", "splat", "android", "SplatRenderer.java"),
+                        os.path.join(ROOT, "gaussian", "android", "SplatRenderer.java"),
                         os.path.join(TESTS, "jvm", "SplatDemo.java")], check=True, capture_output=True)
         r = subprocess.run(["java", f"-Djava.library.path={os.path.join(out, 'linux-x64')}", "-cp", classes,
                             "SplatDemo", self.tmp, str(w), str(h)], capture_output=True, text=True)
@@ -418,7 +418,7 @@ int main() {{
         lib.project_cpu(splats.ctypes.data, cpu.ctypes.data, n, 500.0, (n + 63) // 64, 1, 1)
         self.assertLess((np.abs(metal_out - cpu) / (np.abs(cpu) + 1e-3)).max(), 1e-3)
         # every example's Metal output at least compiles
-        for ex in ("examples/splat/splat.ha", "examples/ai/nn.ha"):
+        for ex in ("gaussian/splat.ha", "examples/ai/nn.ha"):
             with self.subTest(example=ex):
                 src = os.path.join(self.tmp, "ex.metal")
                 with open(src, "w") as f:

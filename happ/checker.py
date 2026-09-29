@@ -6,6 +6,8 @@ calls are classified (user function, builtin, constructor). Both back ends
 """
 
 import difflib
+import math
+import struct
 
 from . import ast as A
 from . import types as T
@@ -37,6 +39,22 @@ STD_IMPL = {"exp": "_std_exp", "exp2": "_std_exp2", "log": "_std_log", "log2": "
             "atan2": "_std_atan2"}
 
 GPU_SCALARS = {"i32", "u32", "f32", "f16", "bool"}
+
+# Names that appear in generated C/C++, Swift, Kotlin, Java, Python or Metal code must not be
+# keywords there (exported functions, kernels, their parameters, structs and fields).
+FOREIGN_RESERVED = set("""
+auto break case char const continue default do double else enum extern float for goto if inline int long
+register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while
+bool true false new delete class this template typename namespace operator public private protected virtual
+friend explicit mutable catch throw try using typeid and or not xor asm nullptr noexcept decltype alignas
+abstract assert boolean byte extends final finally implements import instanceof interface native package
+super synchronized throws transient fun in is object val var typealias typeof when null associatedtype deinit
+fileprivate init inout internal let open precedencegroup protocol rethrows subscript self Self repeat guard
+defer func async await def del elif except from global lambda nonlocal pass raise with yield None True False
+kernel vertex fragment device constant thread threadgroup half uint uchar ushort ulong
+""".split())
+WRAPPER_PARAMS = {"gpu", "kernel", "groups", "groupsX", "groupsY", "groupsZ", "groups_x", "groups_y",
+                  "groups_z", "enc", "params", "env", "cls"}
 RESERVED = {"main", "kernel", "device", "constant", "thread", "threadgroup", "void"}
 
 
@@ -157,7 +175,9 @@ class Checker:
 
     def resolve_struct(self, st, node):
         seen = set()
+        self.check_foreign_name(st.name, node.loc, "struct name")
         for fname, fte, floc in node.fields:
+            self.check_foreign_name(fname, floc, "field")
             if fname in seen:
                 raise HappError(f"field '{fname}' appears twice", floc)
             seen.add(fname)
@@ -201,44 +221,103 @@ class Checker:
         if st == "busy":
             raise HappError(f"constant '{name}' depends on itself", node.loc)
         self.const_state[name] = "busy"
-        val, vty = self.const_eval(node.value)
-        if node.type is not None:
-            ty = self.resolve_type(node.type)
-            val = self.convert_const(val, vty, ty, node.value.loc)
-            node.ty, node.val = ty, val
-            sym = Symbol(name, "const", ty, node=node, value=val)
-        else:
-            if vty in ("int", "float"):
-                ty = T.I32 if vty == "int" else T.F32
-                untyped = vty
+        saved, self.scopes = self.scopes, []          # constants only see other constants
+        try:
+            declared = self.resolve_type(node.type) if node.type is not None else None
+            val, vty = self.const_eval(node.value, declared)
+            if declared is not None:
+                ty = declared
+                if not ty.is_scalar:
+                    raise HappError("constants must be numbers or bools", node.loc)
+                val = self.const_fit(val, vty, ty, node.value.loc)
+                sym = Symbol(name, "const", ty, node=node, value=val)
             else:
-                ty, untyped = vty, None
-            node.ty, node.val = ty, val
-            sym = Symbol(name, "const", ty, node=node, value=val, untyped=untyped)
+                if vty in ("int", "float"):
+                    ty, untyped = (self.const_default_int(val, node.value.loc) if vty == "int" else T.F32), vty
+                else:
+                    ty, untyped = vty, None
+                sym = Symbol(name, "const", ty, node=node, value=val, untyped=untyped)
+        finally:
+            self.scopes = saved
+        node.ty, node.val = ty, val
         self.prog.consts[name] = sym
         self.const_state[name] = "done"
         return node
 
-    def convert_const(self, val, vty, ty, loc):
-        if not ty.is_scalar:
-            raise HappError("constants must be numbers or bools", loc)
-        if ty.is_bool:
-            if not isinstance(val, bool):
-                raise HappError(f"expected a bool constant, found {vty}", loc)
-            return val
-        if isinstance(val, bool):
-            raise HappError("expected a number, found bool", loc)
-        if ty.is_int:
-            if isinstance(val, float):
-                raise HappError(f"float constant can't be used as {ty}", loc)
-            lo, hi = ty.int_range()
-            if not lo <= val <= hi:
-                raise HappError(f"{val} doesn't fit in {ty} (range {lo}..{hi})", loc)
-            return val
-        return float(val)
+    # --- compile-time values follow exactly the run-time rules of each type
+    @staticmethod
+    def wrap_int(v, t):
+        v = int(v) & ((1 << t.bits) - 1)
+        if t.is_signed and v >= 1 << (t.bits - 1):
+            v -= 1 << t.bits
+        return v
 
-    def const_eval(self, e):
-        """Evaluate a compile-time expression -> (python value, 'int'|'float'|Type)."""
+    @staticmethod
+    def round_float(v, t):
+        v = float(v)
+        if t.bits == 64 or v != v:
+            return v
+        code = "<e" if t.bits == 16 else "<f"
+        try:
+            return struct.unpack(code, struct.pack(code, v))[0]
+        except (OverflowError, struct.error):
+            return math.copysign(float("inf"), v)
+
+    def const_default_int(self, v, loc):
+        if -(1 << 31) <= v < (1 << 31):
+            return T.I32
+        if -(1 << 63) <= v < (1 << 63):
+            return T.I64
+        if 0 <= v < (1 << 64):
+            return T.U64
+        raise HappError(f"{v} is too large for any integer type", loc)
+
+    def const_fit(self, v, kind, ty, loc):
+        """Give an untyped constant value (or a typed one) the type `ty`, like a literal."""
+        if not isinstance(kind, str):
+            if kind != ty:
+                raise HappError(f"expected {ty}, found {kind}", loc, f"convert with 'as {ty}'")
+            return v
+        if ty.is_bool:
+            raise HappError(f"expected a bool, found a number", loc)
+        if ty.is_int:
+            if kind == "float":
+                raise HappError(f"expected an integer ({ty}), found a decimal number", loc)
+            lo, hi = ty.int_range()
+            if not lo <= v <= hi:
+                raise HappError(f"{v} doesn't fit in {ty} (range {lo}..{hi})", loc)
+            return v
+        return self.round_float(v, ty)
+
+    def const_convert(self, v, src, dst, loc):
+        """`v as dst` at compile time (same result as at run time)."""
+        if not dst.is_scalar:
+            raise HappError(f"constants can't be converted to {dst}", loc)
+        if dst.is_bool:
+            if src == T.BOOL:
+                return v
+            raise HappError(f"can't convert {src} to bool", loc, "use 'x != 0'")
+        src_float = src == "float" or (isinstance(src, T.Type) and src.is_float)
+        if src == T.BOOL:
+            if dst.is_float:
+                raise HappError("can't convert bool to a float", loc)
+            return int(v)
+        if dst.is_int:
+            if src_float:
+                if v != v:
+                    return 0
+                lo, hi = dst.int_range()
+                if v in (float("inf"), float("-inf")):
+                    return hi if v > 0 else lo
+                return max(lo, min(hi, math.trunc(v)))        # saturating, like the CPU
+            return self.wrap_int(v, dst)
+        return self.round_float(v, dst)
+
+    def const_eval(self, e, expected=None):
+        """Evaluate a compile-time expression -> (python value, 'int' | 'float' | Type).
+
+        'int'/'float' are untyped values (exact), which take a type from where they are used.
+        `expected` is the declared type: literal operands then take it, exactly as at run time."""
         if isinstance(e, A.IntLit):
             return e.value, "int"
         if isinstance(e, A.FloatLit):
@@ -246,56 +325,126 @@ class Checker:
         if isinstance(e, A.BoolLit):
             return e.value, T.BOOL
         if isinstance(e, A.Name):
+            for sc in reversed(self.scopes):
+                if e.id in sc and sc[e.id].kind != "const":
+                    raise HappError(f"'{e.id}' is a variable here; this needs a compile-time constant", e.loc)
             if e.id not in self.const_nodes:
                 raise HappError(f"'{e.id}' is not a constant", e.loc)
             node = self.eval_const_def(e.id)
             sym = self.prog.consts[e.id]
             return node.val, (sym.untyped or node.ty)
         if isinstance(e, A.Unary):
-            v, t = self.const_eval(e.operand)
-            if e.op == "-" and not isinstance(v, bool):
-                return -v, t
-            if e.op == "!" and isinstance(v, bool):
+            v, t = self.const_eval(e.operand, expected)
+            if isinstance(t, str) and expected is not None and expected.is_numeric and e.op in ("-", "~"):
+                v, t = self.const_fit(v, t, expected, e.operand.loc), expected
+            if e.op == "!":
+                if t != T.BOOL:
+                    raise HappError(f"'!' needs a bool, found {t}", e.loc)
                 return not v, t
-            if e.op == "~" and isinstance(v, int) and not isinstance(v, bool):
-                return ~v, t
+            if t == T.BOOL:
+                raise HappError(f"'{e.op}' can't be used on a bool", e.loc)
+            if e.op == "-":
+                if isinstance(t, T.Type):
+                    return (self.wrap_int(-v, t) if t.is_int else -v), t
+                return -v, t
+            if e.op == "~":
+                if t == "float" or (isinstance(t, T.Type) and t.is_float):
+                    raise HappError("'~' needs an integer", e.loc)
+                return (self.wrap_int(~v, t) if isinstance(t, T.Type) else ~v), t
         if isinstance(e, A.Cast):
-            v, _ = self.const_eval(e.expr)
-            ty = self.resolve_type(e.type)
-            if ty.is_int and not isinstance(v, bool):
-                return int(v), ty
-            if ty.is_float and not isinstance(v, bool):
-                return float(v), ty
+            v, t = self.const_eval(e.expr)
+            dst = self.resolve_type(e.type)
+            return self.const_convert(v, t, dst, e.loc), dst
         if isinstance(e, A.Binary):
-            a, at = self.const_eval(e.left)
-            b, bt = self.const_eval(e.right)
-            op = e.op
-            is_float = isinstance(a, float) or isinstance(b, float)
-            rt = at if not isinstance(at, str) else bt
-            if isinstance(rt, str):
-                rt = "float" if is_float else "int"
-            try:
-                if op in ("+", "-", "*"):
-                    return {"+": a + b, "-": a - b, "*": a * b}[op], rt
-                if op == "/":
-                    return (a / b if is_float else int(a / b)), rt
-                if op == "%":
-                    return (a - b * int(a / b)), rt
-                if op in ("<<", ">>", "&", "|", "^") and not is_float:
-                    return {"<<": a << b, ">>": a >> b, "&": a & b, "|": a | b, "^": a ^ b}[op], rt
-                if op in ("==", "!=", "<", ">", "<=", ">="):
-                    return {"==": a == b, "!=": a != b, "<": a < b, ">": a > b,
-                            "<=": a <= b, ">=": a >= b}[op], T.BOOL
-                if op in ("&&", "||"):
-                    return (a and b) if op == "&&" else (a or b), T.BOOL
-            except ZeroDivisionError:
-                raise HappError("division by zero in constant", e.loc)
+            return self.const_binary(e, expected)
         raise HappError("this expression is not a compile-time constant", e.loc)
 
+    def const_binary(self, e, expected=None):
+        op = e.op
+        arith = op not in ("&&", "||", "==", "!=", "<", ">", "<=", ">=")
+        sub = expected if arith and expected is not None and expected.is_numeric else None
+        a, at = self.const_eval(e.left, sub)
+        b, bt = self.const_eval(e.right, sub if op not in ("<<", ">>") else None)
+        if sub is not None:
+            if isinstance(at, str):
+                a, at = self.const_fit(a, at, sub, e.left.loc), sub
+            if isinstance(bt, str) and op not in ("<<", ">>"):
+                b, bt = self.const_fit(b, bt, sub, e.right.loc), sub
+        if op in ("&&", "||"):
+            if at != T.BOOL or bt != T.BOOL:
+                raise HappError(f"'{op}' needs bools", e.loc)
+            return (a and b) if op == "&&" else (a or b), T.BOOL
+        # common type, with the same rules as run-time code
+        if at == bt:
+            ct = at
+        elif isinstance(at, str) and isinstance(bt, str):
+            ct = "float" if "float" in (at, bt) else "int"
+        elif isinstance(at, str) and op not in ("<<", ">>"):
+            ct = bt
+            a = self.const_fit(a, at, bt, e.left.loc)
+        elif isinstance(bt, str):
+            ct = at
+            if op not in ("<<", ">>"):
+                b = self.const_fit(b, bt, at, e.right.loc)
+        else:
+            raise HappError(f"'{op}' can't combine {at} and {bt}", e.loc,
+                            "HA++ never converts types silently; use 'as'")
+        if op in ("==", "!=", "<", ">", "<=", ">="):
+            if ct == T.BOOL and op not in ("==", "!="):
+                raise HappError(f"can't compare bools with '{op}'", e.loc)
+            return {"==": a == b, "!=": a != b, "<": a < b, ">": a > b, "<=": a <= b, ">=": a >= b}[op], T.BOOL
+        if ct == T.BOOL:
+            if op in ("&", "|", "^"):
+                return {"&": a and b, "|": a or b, "^": a != b}[op], T.BOOL
+            raise HappError(f"'{op}' can't be used on bools", e.loc)
+        is_float = ct == "float" or (isinstance(ct, T.Type) and ct.is_float)
+        if is_float:
+            if op in ("&", "|", "^", "<<", ">>"):
+                raise HappError(f"'{op}' needs integers", e.loc)
+            if op in ("/", "%") and b == 0:
+                raise HappError("division by zero in a constant", e.loc)
+            if op == "+":
+                r = a + b
+            elif op == "-":
+                r = a - b
+            elif op == "*":
+                r = a * b
+            elif op == "/":
+                r = a / b
+            else:
+                r = a - b * math.trunc(a / b)
+            return (self.round_float(r, ct) if isinstance(ct, T.Type) else r), ct
+        # integers
+        if op in ("/", "%"):
+            if b == 0:
+                raise HappError("division by zero in a constant", e.loc)
+            q = abs(a) // abs(b) * (1 if (a >= 0) == (b >= 0) else -1)
+            r = q if op == "/" else a - b * q
+        elif op in ("<<", ">>"):
+            if isinstance(bt, T.Type) and bt.is_float or bt == "float":
+                raise HappError(f"'{op}' needs an integer shift amount", e.loc)
+            if isinstance(ct, T.Type):
+                b = int(b) & (ct.bits - 1)          # shift amounts are masked, like at run time
+            elif not 0 <= b < 64:
+                raise HappError(f"shift amount {b} is out of range (0..63)", e.right.loc)
+            r = a << b if op == "<<" else a >> b
+        else:
+            r = {"+": a + b, "-": a - b, "*": a * b, "&": a & b, "|": a | b, "^": a ^ b}[op]
+        if isinstance(ct, T.Type):
+            return self.wrap_int(r, ct), ct
+        if abs(r) >= 1 << 64:
+            raise HappError("constant is too large (more than 64 bits)", e.loc)
+        return r, ct
+
     # ------------------------------------------------------------ signatures
+    def check_foreign_name(self, name, loc, what):
+        if name in FOREIGN_RESERVED:
+            raise HappError(f"{what} '{name}' is a keyword in C, Swift, Kotlin, Java, Python or Metal, "
+                            f"which the generated bridges use", loc, "pick another name")
+
     def check_signature(self, fn):
         if fn.name in RESERVED:
-            if not (fn.name == "main" and not fn.is_kernel and not fn.is_export):
+            if not (fn.name == "main" and not fn.is_kernel and not fn.is_export and not fn.is_extern):
                 raise HappError(f"'{fn.name}' is reserved; pick another name", fn.loc)
         for p in fn.params:
             p.ty = self.resolve_type(p.type)
@@ -317,6 +466,13 @@ class Checker:
             else:
                 raise HappError(f"unknown attribute @{attr}", loc,
                                 "known: @workgroup(x,y,z), @inline, @noinline, @strict")
+        if fn.is_export or fn.is_kernel:
+            self.check_foreign_name(fn.name, fn.loc, "the name")
+            for p in fn.params:
+                self.check_foreign_name(p.name, p.loc, "parameter")
+                if fn.is_kernel and p.name in WRAPPER_PARAMS:
+                    raise HappError(f"kernel parameter '{p.name}' clashes with the generated GPU launch "
+                                    f"functions", p.loc, "pick another name")
         if fn.is_kernel:
             wg = fn.attrs.get("workgroup", ([64], None))[0]
             fn.sig["workgroup"] = (list(wg) + [1, 1, 1])[:3]
@@ -556,6 +712,8 @@ class Checker:
             bt = e.base.ty
             if bt.is_ptr:
                 return t, True, ""
+            if bt.is_vec and self.is_multi_swizzle(e.base):
+                return t, False, "a swizzle of a swizzle can't be assigned; name the lane directly (v.z = ...)"
             _, m, why = self.check_lvalue(e.base)
             return t, m, why
         if isinstance(e, A.Field):
@@ -564,6 +722,8 @@ class Checker:
                 return t, True, ""
             if e.kind == "swizzle" and len(set(e.info)) != len(e.info):
                 return t, False, "a swizzle with repeated lanes can't be assigned"
+            if e.kind == "swizzle" and self.is_multi_swizzle(e.base):
+                return t, False, "a swizzle of a swizzle can't be assigned; name the lanes directly (v.xz = ...)"
             _, m, why = self.check_lvalue(e.base)
             return t, m, why
         if isinstance(e, A.Unary) and e.op == "*":
@@ -571,9 +731,17 @@ class Checker:
         t = self.check(e)
         return t, False, "this is a value, not a variable"
 
+    @staticmethod
+    def is_multi_swizzle(e):
+        return isinstance(e, A.Field) and e.kind == "swizzle" and len(e.info) > 1
+
     # ------------------------------------------------------------ expressions
+    ADAPT_OPS = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"}
+
     def untyped(self, e):
-        """'int'/'float' if e is a literal (or untyped constant) that adapts to context."""
+        """'int'/'float' if e is made only of literals (or untyped constants), so it adapts to context.
+
+        `(3000000000 + 1) > x` then takes the type of x, exactly like `x < (3000000000 + 1)`."""
         if isinstance(e, A.IntLit):
             return "int"
         if isinstance(e, A.FloatLit):
@@ -582,10 +750,50 @@ class Checker:
             sym = self.lookup(e.id)
             if sym is not None and sym.kind == "const" and sym.untyped:
                 return sym.untyped
+            return None
+        if isinstance(e, A.Unary) and e.op in ("-", "~"):
+            return self.untyped(e.operand)
+        if isinstance(e, A.Binary) and e.op in self.ADAPT_OPS:
+            lk, rk = self.untyped(e.left), self.untyped(e.right)
+            if lk and rk:
+                return "float" if "float" in (lk, rk) else "int"
+        if isinstance(e, A.Call) and e.name in self.ADAPT_CALLS and e.name not in self.prog.fns and e.args:
+            vals = [a.value for a in e.args][1:] if e.name == "select" else [a.value for a in e.args]
+            kinds = [self.untyped(v) for v in vals]
+            if all(kinds):
+                return "float" if "float" in kinds else "int"
         return None
+
+    ADAPT_CALLS = {"min", "max", "clamp", "abs", "select", "sign", "popcount", "clz", "ctz"}
+
+    def literal_magnitude(self, e):
+        """Largest integer literal in an untyped expression (to pick i32 or i64 when nothing else decides)."""
+        if isinstance(e, A.IntLit):
+            return abs(e.value)
+        if isinstance(e, A.Name):
+            sym = self.lookup(e.id)
+            v = sym.value if sym is not None else 0
+            return abs(v) if isinstance(v, int) and not isinstance(v, bool) else 0
+        if isinstance(e, A.Unary):
+            return self.literal_magnitude(e.operand)
+        if isinstance(e, A.Binary):
+            return max(self.literal_magnitude(e.left), self.literal_magnitude(e.right))
+        if isinstance(e, A.Call):
+            return max((self.literal_magnitude(a.value) for a in e.args), default=0)
+        return 0
+
+    def default_int(self, *exprs):
+        big = max(self.literal_magnitude(x) for x in exprs)
+        if big < (1 << 31):
+            return T.I32
+        return T.I64 if big < (1 << 63) else T.U64
 
     def literal_type(self, kind, value, expected, loc):
         exp = expected.elem_scalar if expected is not None else None
+        if exp is not None and exp.is_float:
+            limit = {16: 65504.0, 32: 3.4028234663852886e38, 64: 1.7976931348623157e308}[exp.bits]
+            if abs(value) > limit * (1 + 2.0 ** -(11 if exp.bits == 16 else 24 if exp.bits == 32 else 53)):
+                raise HappError(f"{value if abs(value) < 1e30 else 'this number'} is too large for {exp}", loc)
         if kind == "int":
             if exp is not None and exp.is_int:
                 lo, hi = exp.int_range()
@@ -598,6 +806,8 @@ class Checker:
                 return T.I32
             if -(1 << 63) <= value < (1 << 63):
                 return T.I64
+            if 0 <= value < (1 << 64):
+                return T.U64
             raise HappError(f"{value} is too large", loc)
         if exp is not None and exp.is_float:
             return exp
@@ -617,7 +827,7 @@ class Checker:
                 if target.is_int and "float" in (lk, rk):
                     target = T.F32
             else:
-                target = T.F32 if "float" in (lk, rk) else T.I32
+                target = T.F32 if "float" in (lk, rk) else self.default_int(left, right)
             self.check(left, target)
             return self.check(right, target)
         if lk:
@@ -679,8 +889,14 @@ class Checker:
                     raise HappError(f"can't compare values of type {lt} with '{e.op}'", e.loc)
                 return T.BOOL
             if e.op in ("<<", ">>"):
-                lt = self.check(e.left, expected if expected is not None and expected.is_int else None)
-                rt = self.check(e.right, lt.elem_scalar if lt.elem_scalar is not None else None)
+                hint = expected if expected is not None and expected.elem_scalar is not None \
+                    and expected.elem_scalar.is_int else None
+                if self.untyped(e.left) and not self.untyped(e.right) and hint is None:
+                    rt = self.check(e.right)                     # 3 >> n: the literal takes n's type
+                    lt = self.check(e.left, rt.elem_scalar if rt.elem_scalar is not None else None)
+                else:
+                    lt = self.check(e.left, hint)
+                    rt = self.check(e.right, lt.elem_scalar if lt.elem_scalar is not None else None)
                 return self.binary_result(e.op, lt, rt, e.loc)
             rt = self.check_operand_pair(e.left, e.right, expected)
             return self.binary_result(e.op, e.left.ty, rt, e.loc)
@@ -688,8 +904,11 @@ class Checker:
             target = self.resolve_type(e.type)
             e.target = target
             k = self.untyped(e.expr)
-            if k and target.is_numeric:
-                src = self.check(e.expr, target if (k == "int" or target.is_float) else None)
+            if k == "float" and target.is_float:
+                src = self.check(e.expr, target)            # 0.1 as f16: rounded once, exactly
+            elif k == "int" and target.is_numeric:
+                # like C/Rust: compute as a normal integer, then convert (-1 as u32 == 4294967295)
+                src = self.check(e.expr, self.default_int(e.expr))
             else:
                 src = self.check(e.expr)
             self.check_cast(src, target, e.loc)
@@ -710,6 +929,8 @@ class Checker:
                 if isinstance(e.index, A.IntLit) and not 0 <= e.index.value < bt.n:
                     raise HappError(f"index {e.index.value} is out of bounds for {bt}", e.index.loc)
                 return bt.elem
+            if (bt.is_vec or bt.is_mat) and isinstance(e.index, A.IntLit) and not 0 <= e.index.value < bt.n:
+                raise HappError(f"index {e.index.value} is out of bounds for {bt} (0..{bt.n - 1})", e.index.loc)
             if bt.is_vec:
                 return bt.elem
             if bt.is_mat:
@@ -742,8 +963,17 @@ class Checker:
             if not e.elems:
                 raise HappError("empty array literal; use 'var a: [N]T;' for a zeroed array", e.loc)
             et = expected.elem if expected is not None and expected.is_array else None
-            first = self.check(e.elems[0], et)
-            for x in e.elems[1:]:
+            anchor = next((x for x in e.elems if not self.untyped(x)), None)
+            if anchor is not None:
+                first = self.check(anchor, et)                # [1, x]: literals take x's type
+            elif et is not None:
+                first = et
+            else:
+                kinds = {self.untyped(x) for x in e.elems}
+                first = T.F32 if "float" in kinds else self.default_int(*e.elems)
+            for x in e.elems:
+                if x is anchor:
+                    continue
                 t = self.check(x, first)
                 self.expect_type(x, t, first)
             if first.is_void or first == T.STR:
@@ -758,8 +988,9 @@ class Checker:
             if isinstance(e.operand, A.Field) and e.operand.kind == "swizzle" or \
                     isinstance(e.operand, A.Index) and e.operand.base.ty.is_vec:
                 raise HappError("can't take the address of a vector component", e.loc)
-            if isinstance(e.operand, A.Name) and not mutable:
-                raise HappError(f"can't take the address of '{e.operand.id}': {why}", e.loc)
+            if not mutable:
+                raise HappError(f"can't take the address of this: {why}", e.loc,
+                                "only 'var' variables (and memory behind pointers) can be changed through '&'")
             self.fn.uses.add("addr")
             return T.Ptr(t)
         if op == "*":
@@ -895,6 +1126,8 @@ class Checker:
 
     def check_mat_ctor(self, e, ty):
         e.kind, e.target = "ctor_mat", ty
+        if any(a.name for a in e.args):
+            raise HappError("matrix constructors take positional arguments", e.loc)
         n = ty.n
         ts = [self.check(a.value, T.F32) for a in e.args]
         if len(ts) == 1 and ts[0] == T.F32:
@@ -998,6 +1231,8 @@ class Checker:
                 return lt
             if lt.is_vec and rt == lt.elem:
                 return lt
+            if rt.is_vec and lt == rt.elem:
+                return rt
             raise HappError(f"'{name}' needs two values of the same type, found {lt} and {rt}", e.loc)
         if name == "clamp":
             need(3)
@@ -1008,7 +1243,7 @@ class Checker:
                 hint = self.check(anchor, expected) if anchor is not None else expected
                 if hint is None or hint.elem_scalar is None:
                     kinds = {self.untyped(a) for a in args}
-                    hint = T.F32 if "float" in kinds else T.I32
+                    hint = T.F32 if "float" in kinds else self.default_int(*args)
                 xt = self.check(args[0], hint.elem_scalar if hint.is_vec else hint)
             for a in args[1:]:
                 t = self.check(a, xt.elem_scalar if xt.is_vec else xt)
@@ -1116,6 +1351,9 @@ class Checker:
         if name in ATOMICS:
             need(3)
             bt = self.check(args[0])
+            if self.fn.is_kernel and not (isinstance(args[0], A.Name) and args[0].ref.kind in ("param", "shared")):
+                raise HappError(f"in a kernel, '{name}' needs a buffer parameter or shared array by name",
+                                args[0].loc, "write atomic_add(buf, i + 1, v) instead of atomic_add(buf + 1, i, v)")
             if bt.is_ptr and bt.pointee in (T.I32, T.U32):
                 et = bt.pointee
             elif bt.is_array and bt.elem in (T.I32, T.U32) and isinstance(args[0], A.Name) \

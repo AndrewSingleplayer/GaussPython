@@ -15,6 +15,17 @@ PUNCT = sorted([
     ".", ",", ":", ";", "(", ")", "[", "]", "{", "}", "@",
 ], key=len, reverse=True)
 
+DIGITS = "0123456789"
+
+
+def is_ident_start(c):
+    return c.isascii() and (c.isalpha() or c == "_")
+
+
+def is_ident_char(c):
+    return c.isascii() and (c.isalnum() or c == "_")
+
+
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
 
 
@@ -65,16 +76,16 @@ def tokenize(text, path):
             i = j + 2
             continue
         start = loc()
-        if c.isalpha() or c == "_":
+        if is_ident_start(c):
             j = i
-            while j < n and (text[j].isalnum() or text[j] == "_"):
+            while j < n and is_ident_char(text[j]):
                 j += 1
             word = text[i:j]
             toks.append(Token("kw" if word in KEYWORDS else "ident", word, start))
             col += j - i
             i = j
             continue
-        if c.isdigit():
+        if c in DIGITS:
             j = i
             is_float = False
             if text.startswith(("0x", "0X"), i):
@@ -94,26 +105,26 @@ def tokenize(text, path):
                     raise HappError("binary literal needs digits", start)
                 val = int(raw, 2)
             else:
-                while j < n and (text[j].isdigit() or text[j] == "_"):
+                while j < n and (text[j] in DIGITS or text[j] == "_"):
                     j += 1
                 # '1.5' is a float, but '0..n' is a range: require a digit after '.'
-                if j + 1 < n and text[j] == "." and text[j + 1].isdigit():
+                if j + 1 < n and text[j] == "." and text[j + 1] in DIGITS:
                     is_float = True
                     j += 1
-                    while j < n and (text[j].isdigit() or text[j] == "_"):
+                    while j < n and (text[j] in DIGITS or text[j] == "_"):
                         j += 1
                 if j < n and text[j] in "eE":
                     k = j + 1
                     if k < n and text[k] in "+-":
                         k += 1
-                    if k < n and text[k].isdigit():
+                    if k < n and text[k] in DIGITS:
                         is_float = True
                         j = k
-                        while j < n and text[j].isdigit():
+                        while j < n and text[j] in DIGITS:
                             j += 1
                 raw = text[i:j].replace("_", "")
                 val = float(raw) if is_float else int(raw)
-            if j < n and (text[j].isalpha() or text[j] == "_"):
+            if j < n and (text[j].isalnum() or text[j] == "_"):
                 raise HappError(f"unexpected character '{text[j]}' after number",
                                 Loc(path, line, col + (j - i)),
                                 "use 'as' to pick a type, e.g. '1.0 as f16'")

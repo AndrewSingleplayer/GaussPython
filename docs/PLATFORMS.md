@@ -95,7 +95,7 @@ My.scaleRun(gpu, k, buf, n, 2f, (n + 63) / 64, 1, 1)   // buffers, scalars, work
 My.batchBegin(gpu); My.aRecord(...); My.bRecord(...); My.batchSubmit(gpu)
 ```
 
-A complete example is `examples/splat/android/SplatRenderer.java`, which
+A complete example is `gaussian/android/SplatRenderer.java`, which
 renders Gaussian splats. It is tested on a desktop JVM.
 
 **ARCore:**
@@ -171,7 +171,7 @@ What to know:
 2. Negate rows 1 and 2 (y-up → y-down, z-back → z-forward).
 3. Get the intrinsics from `frame.camera.intrinsics`.
 
-See `examples/splat/apple/SplatRenderer.swift`.
+See `gaussian/apple/SplatRenderer.swift`.
 
 ---
 
@@ -202,7 +202,7 @@ my.scale(a, len(a), 2.0)          # numpy arrays are passed as pointers
 ```
 
 The GPU runtime functions (`ha_gpu_create`, `ha_dispatch`, …) are also
-exported by the library. See `examples/splat/render.py` for a full GPU host
+exported by the library. See `gaussian/render.py` for a full GPU host
 written in Python.
 
 ## CPU tuning

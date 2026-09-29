@@ -41,10 +41,11 @@ class V:
     """A value: LLVM operand text plus its HA++ type.
 
     Structs and arrays are 'in memory': `ref` is then a pointer to them."""
-    __slots__ = ("ty", "ref")
+    __slots__ = ("ty", "ref", "fresh")
 
-    def __init__(self, ty, ref):
+    def __init__(self, ty, ref, fresh=False):
         self.ty, self.ref = ty, ref
+        self.fresh = fresh      # a new temporary that nothing else points to
 
 
 class FnState:
@@ -77,6 +78,7 @@ class LLVMGen:
         self.strict = strict_math
         self.f16_helpers = f16_helpers
         self.gpu_runtime = gpu_runtime
+        self.need_f64_to_f16 = False
         self.decls = {}
         self.globals = []
         self.strings = {}
@@ -134,7 +136,10 @@ class LLVMGen:
 
     # ================================================================ constants
     def fconst(self, value, t):
-        v = float(value)
+        try:
+            v = float(value)
+        except OverflowError:
+            v = float("inf") if value > 0 else float("-inf")
         if t.bits == 16:
             try:
                 bits = struct.unpack("<H", struct.pack("<e", v))[0]
@@ -144,7 +149,7 @@ class LLVMGen:
         if t.bits == 32:
             try:
                 v = struct.unpack("<f", struct.pack("<f", v))[0]
-            except OverflowError:
+            except (OverflowError, struct.error):
                 v = float("inf") if v > 0 else float("-inf")
         return "0x%016X" % struct.unpack("<Q", struct.pack("<d", v))[0]
 
@@ -219,18 +224,60 @@ class LLVMGen:
     def fm(self):
         return self.s.fmf + " " if self.s.fmf else ""
 
+    def fm_exact_div(self):
+        """Fast-math flags without 'arcp': x/y must be exact where floor/trunc follows (mod, %)."""
+        flags = [f for f in self.s.fmf.split() if f not in ("arcp", "afn")]
+        return " ".join(flags) + " " if flags else ""
+
+    INLINE_COPY_LIMIT = 512
+
     def memcpy(self, dst, src, t):
         size = T.size_align(t)[0]
-        self.intrinsic("llvm.memcpy.inline.p0.p0.i64", "void", ["ptr", "ptr", "i64", "i1"])
-        a = self.align(t)
-        self.emit(f"call void @llvm.memcpy.inline.p0.p0.i64(ptr align {a} {dst}, ptr align {a} {src}, "
-                  f"i64 {size}, i1 false)")
+        self.byte_loop(dst, src, size, self.align(t))
 
     def memzero(self, dst, t):
         size = T.size_align(t)[0]
-        self.intrinsic("llvm.memset.inline.p0.i64", "void", ["ptr", "i8", "i64", "i1"])
-        self.emit(f"call void @llvm.memset.inline.p0.i64(ptr align {self.align(t)} {dst}, i8 0, "
-                  f"i64 {size}, i1 false)")
+        self.byte_loop(dst, None, size, self.align(t))
+
+    def byte_loop(self, dst, src, size, align):
+        """Copy (src) or zero (src=None) `size` bytes. Small: inline intrinsic. Large: a loop over 8-byte
+        words that LLVM vectorizes (never a call to the C library, never megabytes of straight-line code)."""
+        words = size // 8 if size > self.INLINE_COPY_LIMIT else 0
+        if words:
+            slot = self.alloca(T.I64, "i")
+            self.emit(f"store i64 0, ptr {slot}, align 8")
+            head, body, done = self.label("cpy"), self.label("cpyb"), self.label("cpye")
+            self.br(head)
+            self.start(head)
+            i = self.inst(f"load i64, ptr {slot}, align 8")
+            c = self.inst(f"icmp ult i64 {i}, {words}")
+            self.cbr(c, body, done)
+            self.start(body)
+            dp = self.inst(f"getelementptr inbounds i64, ptr {dst}, i64 {i}")
+            if src is None:
+                self.emit(f"store i64 0, ptr {dp}, align {min(align, 8)}")
+            else:
+                sp = self.inst(f"getelementptr inbounds i64, ptr {src}, i64 {i}")
+                w = self.inst(f"load i64, ptr {sp}, align {min(align, 8)}")
+                self.emit(f"store i64 {w}, ptr {dp}, align {min(align, 8)}")
+            n = self.inst(f"add i64 {i}, 1")
+            self.emit(f"store i64 {n}, ptr {slot}, align 8")
+            self.br(head)
+            self.start(done)
+        rest = size - words * 8
+        if rest == 0:
+            return
+        off = words * 8
+        d = self.inst(f"getelementptr inbounds i8, ptr {dst}, i64 {off}") if off else dst
+        a = align if off == 0 else min(align, 8)
+        if src is None:
+            self.intrinsic("llvm.memset.inline.p0.i64", "void", ["ptr", "i8", "i64", "i1"])
+            self.emit(f"call void @llvm.memset.inline.p0.i64(ptr align {a} {d}, i8 0, i64 {rest}, i1 false)")
+        else:
+            sp = self.inst(f"getelementptr inbounds i8, ptr {src}, i64 {off}") if off else src
+            self.intrinsic("llvm.memcpy.inline.p0.p0.i64", "void", ["ptr", "ptr", "i64", "i1"])
+            self.emit(f"call void @llvm.memcpy.inline.p0.p0.i64(ptr align {a} {d}, ptr align {a} {sp}, "
+                      f"i64 {rest}, i1 false)")
 
     def string_global(self, text):
         if text in self.strings:
@@ -367,7 +414,7 @@ class LLVMGen:
         body = []
         for fn in fns:
             if fn.is_extern:
-                params = ", ".join(self.ll(p.ty) for p in fn.params)
+                params = ", ".join(self.param_decl(p.ty) for p in fn.params)
                 self.decl(fn.name, f"declare {self.ret_decl(fn)} @{fn.name}({params})")
                 continue
             if fn.is_kernel:
@@ -388,6 +435,15 @@ class LLVMGen:
         for key, idx in sorted(self.attr_groups.items(), key=lambda kv: kv[1]):
             lines.append(f"attributes #{idx} = {{ {key} }}")
         return "\n".join(lines) + "\n"
+
+    def param_decl(self, t):
+        """C ABI argument type: the caller extends small integers (required on x86-64 and Apple ARM64)."""
+        lt = self.ll(t)
+        if t.is_bool:
+            return "i1 zeroext"
+        if t.is_int and t.bits < 32:
+            return f"{lt} {'signext' if t.is_signed else 'zeroext'}"
+        return lt
 
     def ret_decl(self, fn):
         t = fn.ret_ty
@@ -565,7 +621,7 @@ class LLVMGen:
             if st.op == "=":
                 val = self.expr(st.value)
             else:
-                cur = self.expr(tgt)
+                cur = self.shuffle(self.load(tgt.base.ty, base_ptr), tgt.info)     # base evaluated once
                 val = self.arith(st.op[:-1], cur, self.expr(st.value), st.loc)
             for k, lane in enumerate(tgt.info):
                 p = self.inst(f"getelementptr inbounds {self.ll(et)}, ptr {base_ptr}, i64 {lane}")
@@ -573,11 +629,33 @@ class LLVMGen:
             return
         ptr = self.addr(tgt)
         if st.op == "=":
-            self.store(self.expr(st.value), ptr)
+            val = self.expr(st.value)
+            if val.ty.in_memory and not val.fresh and self.through_pointer(tgt):
+                tmp = self.alloca(val.ty, "ovl")          # source and target may overlap in memory
+                self.memcpy(tmp, val.ref, val.ty)
+                val = V(val.ty, tmp, fresh=True)
+            self.store(val, ptr)
         else:
             cur = self.load(tgt.ty, ptr)
             rhs = self.expr(st.value)
             self.store(self.arith(st.op[:-1], cur, rhs, st.loc), ptr)
+
+    @staticmethod
+    def through_pointer(e):
+        """Does this lvalue reach memory through a pointer (so it may alias other memory)?"""
+        while True:
+            if isinstance(e, A.Unary) and e.op == "*":
+                return True
+            if isinstance(e, A.Index):
+                if e.base.ty.is_ptr:
+                    return True
+                e = e.base
+            elif isinstance(e, A.Field):
+                if e.kind == "ptrfield":
+                    return True
+                e = e.base
+            else:
+                return False
 
     # ================================================================ addresses
     def lookup_var(self, sym):
@@ -686,7 +764,7 @@ class LLVMGen:
             for i, x in enumerate(e.elems):
                 q = self.inst(f"getelementptr inbounds {self.llm(t)}, ptr {p}, i64 0, i64 {i}")
                 self.store(self.expr(x), q)
-            return V(t, p)
+            return V(t, p, fresh=True)
         raise AssertionError(e)
 
     def unary(self, e):
@@ -795,7 +873,7 @@ class LLVMGen:
         if s.is_float:
             fm = self.fm()
             if op == "%":
-                q = self.inst(f"fdiv {fm}{lt} {a.ref}, {b.ref}")
+                q = self.inst(f"fdiv {self.fm_exact_div()}{lt} {a.ref}, {b.ref}")
                 tr = self.call_intrinsic("llvm.trunc", t, [V(t, q)])
                 p = self.inst(f"fmul {fm}{lt} {tr.ref}, {b.ref}")
                 return V(t, self.inst(f"fsub {fm}{lt} {a.ref}, {p}"))
@@ -809,9 +887,34 @@ class LLVMGen:
         if s.is_bool:
             inst = {"&": "and", "|": "or", "^": "xor"}[op]
             return V(t, self.inst(f"{inst} i1 {a.ref}, {b.ref}"))
-        inst = {"+": "add", "-": "sub", "*": "mul", "&": "and", "|": "or", "^": "xor",
-                "/": "sdiv" if s.is_signed else "udiv", "%": "srem" if s.is_signed else "urem"}[op]
+        if op in ("/", "%"):
+            return self.int_divide(op, a, b, t, s)
+        inst = {"+": "add", "-": "sub", "*": "mul", "&": "and", "|": "or", "^": "xor"}[op]
         return V(t, self.inst(f"{inst} {lt} {a.ref}, {b.ref}"))
+
+    def int_divide(self, op, a, b, t, s):
+        """HA++ integer division never traps: x/0 = 0 and x%0 = x (what ARM64 does in hardware),
+        MIN/-1 = MIN and MIN%-1 = 0 (wrap-around). Constant divisors fold all checks away."""
+        lt = self.ll(t)
+        zero, one = self.splat_const(0, t), self.splat_const(1, t)
+        ct = f"<{t.n} x i1>" if t.is_vec else "i1"
+        bad = self.inst(f"icmp eq {lt} {b.ref}, {zero.ref}")
+        if s.is_signed:
+            m1 = self.inst(f"icmp eq {lt} {b.ref}, {self.splat_const(-1, t).ref}")
+            bad = self.inst(f"or {ct} {bad}, {m1}")
+        safe = self.inst(f"select {ct} {bad}, {lt} {one.ref}, {lt} {b.ref}")
+        inst = ("sdiv" if s.is_signed else "udiv") if op == "/" else ("srem" if s.is_signed else "urem")
+        r = self.inst(f"{inst} {lt} {a.ref}, {safe}")
+        # with divisor 1: q = a, r = 0. Fix up the two special cases.
+        isz = self.inst(f"icmp eq {lt} {b.ref}, {zero.ref}")
+        if op == "/":
+            if s.is_signed:
+                neg = self.inst(f"sub {lt} {zero.ref}, {a.ref}")          # a / -1 = -a (wraps for MIN)
+                r = self.inst(f"select {ct} {m1}, {lt} {neg}, {lt} {r}")
+            r = self.inst(f"select {ct} {isz}, {lt} {zero.ref}, {lt} {r}")
+        else:
+            r = self.inst(f"select {ct} {isz}, {lt} {a.ref}, {lt} {r}")      # a % 0 = a; a % -1 = 0 already
+        return V(t, r)
 
     # ================================================================ conversions
     def convert(self, v, dst):
@@ -843,6 +946,9 @@ class LLVMGen:
         if s.is_float and d.is_float:
             if s.bits < d.bits:
                 return V(dst, self.inst(f"fpext {ls} {v.ref} to {ld}"))
+            if s.bits == 64 and d.bits == 16 and not self.is_arm64 and not src.is_vec:
+                self.need_f64_to_f16 = True
+                return V(dst, self.inst(f'call half @"ha.f64_to_f16"(double {v.ref})'))
             return V(dst, self.inst(f"fptrunc {ls} {v.ref} to {ld}"))
         raise HappError(f"internal: can't convert {src} to {dst}")
 
@@ -857,7 +963,15 @@ class LLVMGen:
 
     def call(self, e):
         if e.kind == "fn":
-            return self.call_fn(e.target, [self.expr(a.value) for a in e.args])
+            vals = []
+            for a, p in zip(e.args, e.target.params):
+                v = self.expr(a.value)
+                if p.ty.in_memory and not v.fresh:
+                    tmp = self.alloca(p.ty, "arg")        # copy now: later arguments may change the original
+                    self.memcpy(tmp, v.ref, p.ty)
+                    v = V(p.ty, tmp, fresh=True)
+                vals.append(v)
+            return self.call_fn(e.target, vals)
         if e.kind == "ctor_vec":
             t = e.target
             comps = []
@@ -889,7 +1003,7 @@ class LLVMGen:
             for idx, val in e.info:
                 q = self.inst(f"getelementptr inbounds {self.llm(st)}, ptr {p}, i32 0, i32 {idx}")
                 self.store(self.expr(val), q)
-            return V(st, p)
+            return V(st, p, fresh=True)
         if e.kind == "builtin":
             return self.builtin(e)
         raise AssertionError(e.kind)
@@ -902,15 +1016,20 @@ class LLVMGen:
             args.append(f"ptr {ret_slot}")
         for v, p in zip(vals, fn.params):
             if p.ty.in_memory:
-                tmp = self.alloca(p.ty, "arg")
-                self.memcpy(tmp, v.ref, p.ty)
-                args.append(f"ptr {tmp}")
+                if v.fresh:
+                    args.append(f"ptr {v.ref}")
+                else:
+                    tmp = self.alloca(p.ty, "arg")
+                    self.memcpy(tmp, v.ref, p.ty)
+                    args.append(f"ptr {tmp}")
+            elif fn.is_extern:
+                args.append(f"{self.param_decl(p.ty)} {v.ref}")
             else:
                 args.append(f"{self.ll(p.ty)} {v.ref}")
         sym = self.fn_symbol(fn)
         if ret_slot is not None:
             self.emit(f"call void {sym}({', '.join(args)})")
-            return V(fn.ret_ty, ret_slot)
+            return V(fn.ret_ty, ret_slot, fresh=True)
         rt = self.ret_decl(fn)
         if fn.ret_ty.is_void:
             self.emit(f"call void {sym}({', '.join(args)})")
@@ -1065,7 +1184,7 @@ class LLVMGen:
             if t.is_vec and y.ty.is_scalar:
                 y = self.splat(y, t)
             lt = self.ll(t)
-            q = V(t, self.inst(f"fdiv {fm}{lt} {x.ref}, {y.ref}"))
+            q = V(t, self.inst(f"fdiv {self.fm_exact_div()}{lt} {x.ref}, {y.ref}"))
             f = self.call_intrinsic("llvm.floor", t, [q])
             p = self.inst(f"fmul {fm}{lt} {y.ref}, {f.ref}")
             return V(t, self.inst(f"fsub {fm}{lt} {x.ref}, {p}"))
@@ -1099,6 +1218,10 @@ class LLVMGen:
     def minmax(self, name, a, b):
         t = a.ty
         s = t.elem_scalar
+        if s == T.F16 and not self.is_arm64:
+            wide = T.Vec(T.F32, t.n) if t.is_vec else T.F32
+            r = self.minmax(name, self.convert(a, wide), self.convert(b, wide))
+            return self.convert(r, t)
         if s.is_float:
             return self.call_intrinsic("llvm.minnum" if name == "min" else "llvm.maxnum", t, [a, b])
         base = ("s" if s.is_signed else "u") + name
@@ -1476,9 +1599,33 @@ class LLVMGen:
                        "test %rcx, (%rcx)", "sub $0x1000, %rax", "cmp $0x1000, %rax", "ja 2b", "1:",
                        "sub %rax, %rcx", "test %rcx, (%rcx)", "pop %rax", "pop %rcx", "ret"]
             self.out.extend(f'module asm "{line}"' for line in asm)
+        if self.need_f64_to_f16 or self.f16_helpers:
+            out += self.gen_f64_to_f16()
         if self.f16_helpers:
             out += self.gen_f16_helpers()
         return out
+
+    def gen_f64_to_f16(self):
+        """double -> half with one rounding: round to float with 'round to odd', then to half."""
+        attrs = self.attr_group()
+        self.intrinsic("llvm.fabs.f64", "double", ["double"])
+        return [
+            f'define internal half @"ha.f64_to_f16"(double %d) {attrs} {{',
+            "entry:",
+            "  %f = fptrunc double %d to float",
+            "  %back = fpext float %f to double",
+            "  %ad = call double @llvm.fabs.f64(double %d)",
+            "  %ab = call double @llvm.fabs.f64(double %back)",
+            "  %away = fcmp ogt double %ab, %ad",
+            "  %bits = bitcast float %f to i32",
+            "  %dec = sub i32 %bits, 1",
+            "  %t = select i1 %away, i32 %dec, i32 %bits",
+            "  %inexact = fcmp une double %back, %d",
+            "  %odd = or i32 %t, 1",
+            "  %r = select i1 %inexact, i32 %odd, i32 %t",
+            "  %fo = bitcast i32 %r to float",
+            "  %h = fptrunc float %fo to half",
+            "  ret half %h", "}", ""]
 
     def gen_f16_helpers(self):
         """Half<->float conversions for x86 CPUs without F16C (e.g. the Android emulator ABI)."""
@@ -1536,7 +1683,6 @@ class LLVMGen:
             "  ret half %h", "}", "",
             f"define hidden half @__truncdfhf2(double %d) {attrs} {{",
             "entry:",
-            "  %f = fptrunc double %d to float",
-            "  %h = call half @__truncsfhf2(float %f)",
+            '  %h = call half @"ha.f64_to_f16"(double %d)',
             "  ret half %h", "}", "",
         ]

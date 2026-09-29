@@ -39,6 +39,7 @@ class Emitter:
         self.tmp = 0
         self.kernel = None
         self.fn = None
+        self.helpers = set()
 
     # ------------------------------------------------------------ type names
     def tname(self, t):
@@ -61,6 +62,12 @@ class Emitter:
                 return f"{self.mname(t.elem)}[{t.n}]"
             return f"array<{self.mname(t.elem)}, {t.n}>"
         raise HappError(f"internal: no GPU type for {t}")
+
+    def utname(self, t):
+        """Unsigned type with the same shape (for wrap-around math in Metal)."""
+        if t.is_vec:
+            return self.tname(T.Vec(T.U32, t.n))
+        return "uint"
 
     def mname(self, t):
         """Memory-form type name (inside buffers, structs and arrays)."""
@@ -195,6 +202,9 @@ class Emitter:
         if isinstance(e, A.Unary):
             v = self.ex(e.operand)
             if e.op == "-":
+                st = e.ty.elem_scalar
+                if not self.glsl and st is not None and st.is_int and st.is_signed:
+                    return f"{self.tname(e.ty)}(-{self.utname(e.ty)}({v}))"
                 return f"(-{v})"
             if e.op == "!":
                 return f"(!{v})"
@@ -278,9 +288,18 @@ class Emitter:
         if lt.is_bool and op in ("&", "|", "^"):
             return f"({a} {'&&' if op == '&' else '||' if op == '|' else '!='} {b})"
         s = (lt if not lt.is_mat else rt).elem_scalar
+        wrap_signed = not self.glsl and s.is_int and s.is_signed
         if op in ("<<", ">>"):
-            bits = 16 if s.bits == 16 else 31
-            return f"({a} {op} ({b} & {self.lit(bits, rt.elem_scalar)}))"
+            amount = f"({b} & {self.lit(s.bits - 1, rt.elem_scalar)})"
+            if op == "<<" and wrap_signed:
+                # Metal is C++: shifting a negative int left is undefined, so shift the raw bits
+                return f"{self.tname(e.ty)}({self.utname(lt)}({a}) << {amount})"
+            return f"({a} {op} {amount})"
+        if wrap_signed and op in ("+", "-", "*"):
+            # HA++ ints wrap on overflow; in Metal (C++) signed overflow is undefined -> use unsigned math
+            ua = f"{self.utname(lt)}({a})"
+            ub = f"{self.utname(rt)}({b})"
+            return f"{self.tname(e.ty)}({ua} {op} {ub})"
         if op == "%":
             if s.is_float:
                 if self.glsl:
@@ -330,6 +349,14 @@ class Emitter:
             for i in range(2):
                 if args[i].ty.is_scalar:
                     xs[i] = f"{self.tname(t)}({xs[i]})"
+        if name == "abs" and t.elem_scalar.is_int and not t.elem_scalar.is_signed:
+            return xs[0]                       # GLSL/Metal have no abs(uint); it is the identity
+        if name == "abs" and not g and t.elem_scalar.is_int:
+            self.helpers.add("iabs")           # abs(INT_MIN) must wrap, not be undefined
+            return f"ha_iabs({xs[0]})"
+        if name == "sign" and not g and not t.elem_scalar.is_float:
+            tn = self.tname(t)                 # Metal's sign() is float-only
+            return f"({tn}({xs[0]} > 0) - {tn}({xs[0]} < 0))"
         if name in self.SAME:
             return f"{name}({', '.join(xs)})"
         if name == "rsqrt":
@@ -363,7 +390,8 @@ class Emitter:
         if name == "popcount":
             return f"{self.tname(t)}(bitCount({xs[0]}))" if g else f"popcount({xs[0]})"
         if name == "clz":
-            return f"{self.tname(t)}(31 - findMSB({xs[0]}))" if g else f"clz({xs[0]})"
+            # findMSB of a negative int finds the highest 0 bit, so count on the raw bits (uint)
+            return f"{self.tname(t)}(31 - findMSB(uint({xs[0]})))" if g else f"clz({xs[0]})"
         if name == "ctz":
             if g:
                 return f"({xs[0]} == {self.lit(0, t)} ? {self.lit(32, t)} : {self.tname(t)}(findLSB({xs[0]})))"
@@ -732,7 +760,12 @@ def generate_metal(prog):
     packed = em.packed_defs()
     head = ["// HA++ Metal kernels (generated; edit the .ha source instead)",
             "#include <metal_stdlib>", "using namespace metal;", ""]
-    parts = head + packed + [""] + structs + param_structs + [""] + fn_lines + kernel_lines
+    helpers = []
+    if "iabs" in em.helpers:
+        helpers.append("static inline int ha_iabs(int x) { return x < 0 ? int(-uint(x)) : x; }")
+        for n in (2, 3, 4):
+            helpers.append(f"static inline int{n} ha_iabs(int{n} x) {{ return select(x, int{n}(-uint{n}(x)), x < 0); }}")
+    parts = head + helpers + packed + [""] + structs + param_structs + [""] + fn_lines + kernel_lines
     return "\n".join(parts) + "\n"
 
 

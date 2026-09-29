@@ -1,7 +1,7 @@
 """Render Gaussian splats with the HA++ splat pipeline on this PC's GPU (Vulkan).
 
-    python examples/splat/render.py --synthetic 20000 --out splats.png
-    python examples/splat/render.py --ply scene.ply --out scene.png --size 1280x720
+    python gaussian/render.py --synthetic 20000 --out splats.png
+    python gaussian/render.py --ply scene.ply --out scene.png --size 1280x720
 
 This is the same code path an Android app uses (the Kotlin/Java version calls
 the same kernels through JNI); on iPhone the Swift wrapper runs the Metal
@@ -19,7 +19,7 @@ import zlib
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 P, U32, U64 = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64

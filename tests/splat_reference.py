@@ -1,4 +1,4 @@
-"""Independent NumPy implementation of examples/splat/splat.ha (for testing the GPU pipeline)."""
+"""Independent NumPy implementation of gaussian/splat.ha (for testing the GPU pipeline)."""
 
 import numpy as np
 

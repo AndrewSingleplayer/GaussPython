@@ -221,10 +221,11 @@ class Unary(Expr):
 
 
 class Binary(Expr):
-    __slots__ = ("op", "left", "right")
+    __slots__ = ("op", "left", "right", "paren")
 
     def __init__(self, op, left, right, loc):
         self.op, self.left, self.right, self.loc, self.ty = op, left, right, loc, None
+        self.paren = False      # written as (a op b): a comparison in parentheses may be compared again
 
 
 class Cast(Expr):

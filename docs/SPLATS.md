@@ -1,6 +1,6 @@
 # Gaussian splats for AR on phones
 
-`examples/splat/splat.ha` is a complete Gaussian splatting renderer written in
+`gaussian/splat.ha` is a complete Gaussian splatting renderer written in
 HA++. It runs on Vulkan (Android, PC), on Metal (iPhone), and its CPU parts
 run on every target.
 
@@ -26,10 +26,10 @@ run on every target.
 
 The host needs two GPU submits per frame. After steps 1–2 it reads one number
 (the total pair count) to size the sort. The hosts are:
-- **Python (PC):** `examples/splat/render.py`, tested.
-- **Java (Android):** `examples/splat/android/SplatRenderer.java`, tested on
+- **Python (PC):** `gaussian/render.py`, tested.
+- **Java (Android):** `gaussian/android/SplatRenderer.java`, tested on
   a desktop JVM.
-- **Swift (iPhone):** `examples/splat/apple/SplatRenderer.swift`, not
+- **Swift (iPhone):** `gaussian/apple/SplatRenderer.swift`, not
   compiled yet.
 
 ## Verified on the build machine

@@ -178,7 +178,7 @@ HA_MAP1(sign, (float)((x > 0.0f) - (x < 0.0f)))
 HA_MAP2(pow, std::pow(x, y)) HA_MAP2(atan2, std::atan2(x, y)) HA_MAP2(fmod, std::fmod(x, y))
 HA_MAP2(step, (float)(y >= x))
 
-inline int abs(int x) { return x < 0 ? -x : x; }
+// abs(int) comes from the C library (Metal's integer abs has the same meaning)
 inline float abs(float x) { return std::fabs(x); }
 inline half abs(half x) { return x < (half)0 ? -x : x; }
 template <class V, class = typename vt<V>::elem> inline V abs(V v) {
@@ -217,6 +217,14 @@ inline uint ctz(uint x) { return x ? (uint)__builtin_ctz(x) : 32u; }
 inline int popcount(int x) { return __builtin_popcount((uint)x); }
 inline int clz(int x) { return x ? __builtin_clz((uint)x) : 32; }
 inline int ctz(int x) { return x ? __builtin_ctz((uint)x) : 32; }
+
+// select(a, b, c): c ? b : a per lane (vectors) or for scalars
+template <class T> inline T select(T a, T b, bool c) { return c ? b : a; }
+template <class V, class M, class = typename vt<V>::elem> inline V select(V a, V b, M c) {
+    V r;
+    for (int i = 0; i < vt<V>::N; i++) r[i] = c[i] ? b[i] : a[i];
+    return r;
+}
 
 template <class T, class F> inline T as_type(F x) {
     static_assert(sizeof(T) == sizeof(F), "as_type size");

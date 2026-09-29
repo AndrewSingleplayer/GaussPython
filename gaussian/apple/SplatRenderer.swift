@@ -1,5 +1,5 @@
 // Gaussian splat renderer for iPhone / Mac, using the Swift package that
-// `happ build examples/splat/splat.ha -t ios` generates (apple/Splat).
+// `happ build gaussian/splat.ha -t ios` generates (apple/Splat).
 //
 // NOTE: written against the generated API but not compiled here (no Swift or
 // Metal toolchain on the Linux build machine). The same kernels run through
